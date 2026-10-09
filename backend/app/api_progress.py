@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.database import SessionLocal
-from app.db.models import Milestone, Project, Submission
+from app.db.models import DocumentAnalysis, Milestone, Project, Submission
 
 router = APIRouter(prefix="/projects", tags=["Progress Monitoring"])
 
@@ -38,6 +38,21 @@ def get_project_progress(
         .order_by(Submission.week_number)
         .all()
     )
+    analyses_by_submission: dict[int, list[DocumentAnalysis]] = {}
+    if submissions:
+        analyses = (
+            db.query(DocumentAnalysis)
+            .filter(
+                DocumentAnalysis.submission_id.in_(
+                    [submission.id for submission in submissions]
+                )
+            )
+            .all()
+        )
+        for analysis in analyses:
+            analyses_by_submission.setdefault(analysis.submission_id, []).append(
+                analysis
+            )
 
     total_milestones = len(milestones)
     completed_milestones = sum(1 for m in milestones if m.completed)
@@ -73,6 +88,10 @@ def get_project_progress(
             "week_number": submission.week_number,
             "status": submission.status,
             "missing_documents": missing_documents,
+            "document_analyses": _submission_document_analyses(
+                submission,
+                analyses_by_submission.get(submission.id, []),
+            ),
             "submitted_at": (
                 submission.submitted_at.isoformat()
                 if submission.submitted_at else None
@@ -106,3 +125,51 @@ def get_project_progress(
             "details": submission_details,
         },
     }
+
+
+def _submission_document_analyses(
+    submission: Submission,
+    analyses: list[DocumentAnalysis],
+) -> list[dict]:
+    analyses_by_type = {analysis.document_type: analysis for analysis in analyses}
+    documents = []
+
+    for document_type, file_path in (
+        ("report", submission.report_path),
+        ("srs", submission.srs_path),
+    ):
+        if not file_path:
+            continue
+
+        analysis = analyses_by_type.get(document_type)
+        if analysis is None:
+            documents.append({
+                "submission_id": submission.id,
+                "document_type": document_type,
+                "status": "not_analyzed",
+                "analysis_status": None,
+                "completeness_percentage": None,
+                "missing_sections": [],
+                "warnings": [],
+                "extraction_errors": [],
+            })
+            continue
+
+        analysis_status = analysis.analysis_status
+        status = (
+            analysis_status
+            if analysis_status in {"complete", "incomplete"}
+            else "failed"
+        )
+        documents.append({
+            "submission_id": submission.id,
+            "document_type": document_type,
+            "status": status,
+            "analysis_status": analysis_status,
+            "completeness_percentage": analysis.completeness_percentage,
+            "missing_sections": analysis.missing_sections or [],
+            "warnings": analysis.warnings or [],
+            "extraction_errors": analysis.extraction_errors or [],
+        })
+
+    return documents

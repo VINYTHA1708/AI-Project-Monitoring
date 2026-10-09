@@ -9,6 +9,7 @@ from app.api_submissions import router as submissions_router
 from app.api_progress import router as progress_router
 from app.api_uploads import router as uploads_router
 from app.api_submission_uploads import router as submission_uploads_router
+from app.api_document_analysis import router as document_analysis_router
 
 app = FastAPI(
     title="AI-Based Student Project Monitoring & Review Automation System",
@@ -24,6 +25,7 @@ app.include_router(submissions_router)
 app.include_router(progress_router)
 app.include_router(uploads_router)
 app.include_router(submission_uploads_router)
+app.include_router(document_analysis_router)
 
 
 @app.get("/")

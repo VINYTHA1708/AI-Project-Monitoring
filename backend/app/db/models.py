@@ -7,8 +7,10 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     Boolean,
+    JSON,
+    UniqueConstraint,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 class Base(DeclarativeBase):
@@ -99,3 +101,59 @@ class Submission(Base):
         String(30), default="SUBMITTED", nullable=False
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    document_analyses: Mapped[list["DocumentAnalysis"]] = relationship(
+        back_populates="submission",
+        cascade="all, delete-orphan",
+    )
+
+
+class DocumentAnalysis(Base):
+    """Persist the latest rule-based analysis for each submission/document type.
+
+    Only one analysis row is kept for each submission and document type. This avoids
+    stale duplicate rows and keeps the most recent result authoritative for the
+    corresponding submission artifact.
+    """
+
+    __tablename__ = "document_analysis"
+    __table_args__ = (
+        UniqueConstraint(
+            "submission_id",
+            "document_type",
+            name="uq_document_analysis_submission_document_type",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    submission_id: Mapped[int] = mapped_column(
+        ForeignKey("submissions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    document_type: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="report"
+    )
+    analysis_status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="pending"
+    )
+    completeness_percentage: Mapped[float | None] = mapped_column(
+        nullable=True
+    )
+    detected_sections: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    missing_sections: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    word_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    warnings: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    extraction_errors: Mapped[list[str] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    analyzed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    submission: Mapped[Submission] = relationship(
+        back_populates="document_analyses"
+    )
