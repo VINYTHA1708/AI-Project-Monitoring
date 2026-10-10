@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 from argon2 import PasswordHasher
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -91,7 +91,7 @@ def migrated_postgres_schema(monkeypatch):
         )
         for statement in migration_sql.split(";"):
             if statement.strip():
-                connection.exec_driver_sql(statement)
+                connection.execute(text(statement))
 
     monkeypatch.setattr(
         settings,
