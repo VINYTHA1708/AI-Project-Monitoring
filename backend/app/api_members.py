@@ -1,28 +1,23 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.db.database import SessionLocal
+from app.auth.dependencies import get_db, require_faculty_project, require_project_access
 from app.db.models import Project, ProjectMember, Student
 
 router = APIRouter(
     prefix="/projects/{project_id}/members",
     tags=["Project Members"],
+    dependencies=[Depends(require_project_access)],
 )
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 class MemberCreate(BaseModel):
     student_id: int
-    role: str = "MEMBER"
+    role: Literal["MEMBER"] = "MEMBER"
 
 
 class MemberResponse(BaseModel):
@@ -34,7 +29,12 @@ class MemberResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-@router.post("/", response_model=MemberResponse, status_code=201)
+@router.post(
+    "/",
+    response_model=MemberResponse,
+    status_code=201,
+    dependencies=[Depends(require_faculty_project)],
+)
 def add_member(
     project_id: int,
     data: MemberCreate,
@@ -87,7 +87,11 @@ def list_members(project_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.delete("/{student_id}", status_code=204)
+@router.delete(
+    "/{student_id}",
+    status_code=204,
+    dependencies=[Depends(require_faculty_project)],
+)
 def remove_member(
     project_id: int,
     student_id: int,

@@ -4,18 +4,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
-from app.db.database import SessionLocal
+from app.auth.dependencies import require_faculty_project, require_project_access, get_db
 from app.db.models import Milestone, Project
 
-router = APIRouter(prefix="/projects/{project_id}/milestones", tags=["Milestones"])
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+router = APIRouter(
+    prefix="/projects/{project_id}/milestones",
+    tags=["Milestones"],
+    dependencies=[Depends(require_project_access)],
+)
 
 
 class MilestoneCreate(BaseModel):
@@ -48,7 +44,12 @@ def ensure_project_exists(project_id: int, db: Session):
         raise HTTPException(status_code=404, detail="Project not found")
 
 
-@router.post("/", response_model=MilestoneResponse, status_code=201)
+@router.post(
+    "/",
+    response_model=MilestoneResponse,
+    status_code=201,
+    dependencies=[Depends(require_faculty_project)],
+)
 def create_milestone(
     project_id: int,
     data: MilestoneCreate,
@@ -98,7 +99,11 @@ def get_milestone(
     return milestone
 
 
-@router.put("/{milestone_id}", response_model=MilestoneResponse)
+@router.put(
+    "/{milestone_id}",
+    response_model=MilestoneResponse,
+    dependencies=[Depends(require_faculty_project)],
+)
 def update_milestone(
     project_id: int,
     milestone_id: int,
@@ -125,7 +130,11 @@ def update_milestone(
     return milestone
 
 
-@router.delete("/{milestone_id}", status_code=204)
+@router.delete(
+    "/{milestone_id}",
+    status_code=204,
+    dependencies=[Depends(require_faculty_project)],
+)
 def delete_milestone(
     project_id: int,
     milestone_id: int,

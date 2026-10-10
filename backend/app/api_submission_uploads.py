@@ -1,14 +1,19 @@
 ﻿from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+import zipfile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
-from app.db.database import SessionLocal
+from app.auth.dependencies import get_db, require_project_access
 from app.db.models import Project, Submission
 
-router = APIRouter(prefix="/projects", tags=["Submission Uploads"])
+router = APIRouter(
+    prefix="/projects",
+    tags=["Submission Uploads"],
+    dependencies=[Depends(require_project_access)],
+)
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -20,12 +25,14 @@ ALLOWED_TYPES = {
 }
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def _valid_signature(extension: str, header: bytes) -> bool:
+    if extension == ".pdf":
+        return b"%PDF-" in header[:1024]
+    if extension == ".pptx":
+        return header.startswith(b"PK\x03\x04")
+    if extension == ".ppt":
+        return header.startswith(bytes.fromhex("D0CF11E0A1B11AE1"))
+    return False
 
 
 async def save_file(file: UploadFile, category: str) -> str:
@@ -33,6 +40,7 @@ async def save_file(file: UploadFile, category: str) -> str:
     extension = Path(original_name).suffix.lower()
 
     if not original_name or extension not in ALLOWED_TYPES[category]:
+        await file.close()
         raise HTTPException(
             status_code=400,
             detail=f"Invalid {category} file type.",
@@ -43,6 +51,14 @@ async def save_file(file: UploadFile, category: str) -> str:
     total_size = 0
 
     try:
+        header = await file.read(1024)
+        await file.seek(0)
+        if not _valid_signature(extension, header):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {category} file content.",
+            )
+
         with destination.open("wb") as output:
             while True:
                 chunk = await file.read(1024 * 1024)
@@ -64,7 +80,19 @@ async def save_file(file: UploadFile, category: str) -> str:
                 detail=f"{category.capitalize()} file is empty.",
             )
 
-        return str(destination)
+        if extension == ".pptx":
+            try:
+                with zipfile.ZipFile(destination) as archive:
+                    valid_presentation = "ppt/presentation.xml" in archive.namelist()
+            except (OSError, zipfile.BadZipFile):
+                valid_presentation = False
+            if not valid_presentation:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid presentation file content.",
+                )
+
+        return destination.name
 
     except Exception:
         destination.unlink(missing_ok=True)
@@ -130,14 +158,14 @@ async def upload_submission(
             "submission_id": submission.id,
             "project_id": project_id,
             "week_number": week_number,
-            "report_path": report_path,
-            "presentation_path": presentation_path,
-            "srs_path": srs_path,
+            "report_uploaded": bool(report_path),
+            "presentation_uploaded": bool(presentation_path),
+            "srs_uploaded": bool(srs_path),
             "status": submission.status,
         }
 
     except Exception:
         db.rollback()
         for path in saved_paths:
-            Path(path).unlink(missing_ok=True)
+            (UPLOAD_DIR / path).unlink(missing_ok=True)
         raise

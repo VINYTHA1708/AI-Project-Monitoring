@@ -2,18 +2,17 @@
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy.orm import Session
 
-from app.db.database import SessionLocal
-from app.db.models import Project
+from app.auth.dependencies import (
+    Principal,
+    get_current_account,
+    get_db,
+    require_faculty_project,
+    require_project_access,
+    require_roles,
+)
+from app.db.models import FacultyProjectAssignment, Project, ProjectMember
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 class ProjectCreate(BaseModel):
@@ -32,25 +31,63 @@ class ProjectResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-@router.post("/", response_model=ProjectResponse, status_code=201)
-def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
+@router.post(
+    "/",
+    response_model=ProjectResponse,
+    status_code=201,
+    dependencies=[Depends(require_roles("faculty"))],
+)
+def create_project(
+    data: ProjectCreate,
+    account: Principal = Depends(require_roles("faculty")),
+    db: Session = Depends(get_db),
+):
     project = Project(
         title=data.title,
         description=data.description,
         github_url=str(data.github_url) if data.github_url else None,
     )
     db.add(project)
+    db.flush()
+    db.add(
+        FacultyProjectAssignment(
+            faculty_account_id=account.id,
+            project_id=project.id,
+        )
+    )
     db.commit()
     db.refresh(project)
     return project
 
 
 @router.get("/", response_model=list[ProjectResponse])
-def list_projects(db: Session = Depends(get_db)):
-    return db.query(Project).order_by(Project.id).all()
+def list_projects(
+    account: Principal = Depends(get_current_account),
+    db: Session = Depends(get_db),
+):
+    if account.role == "faculty":
+        query = (
+            db.query(Project)
+            .join(
+                FacultyProjectAssignment,
+                FacultyProjectAssignment.project_id == Project.id,
+            )
+            .filter(FacultyProjectAssignment.faculty_account_id == account.id)
+        )
+    else:
+        query = (
+            db.query(Project)
+            .join(ProjectMember, ProjectMember.project_id == Project.id)
+            .filter(ProjectMember.student_id == account.student_id)
+        )
+    return query.order_by(Project.id).all()
 
 
-@router.get("/{project_id}", response_model=ProjectResponse)
+@router.get(
+    "/{project_id}",
+    response_model=ProjectResponse,
+    dependencies=[Depends(require_project_access)],
+)
 def get_project(project_id: int, db: Session = Depends(get_db)):
     project = db.get(Project, project_id)
     if project is None:
@@ -58,7 +95,11 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
     return project
 
 
-@router.put("/{project_id}", response_model=ProjectResponse)
+@router.put(
+    "/{project_id}",
+    response_model=ProjectResponse,
+    dependencies=[Depends(require_faculty_project)],
+)
 def update_project(
     project_id: int,
     data: ProjectCreate,
@@ -77,7 +118,11 @@ def update_project(
     return project
 
 
-@router.delete("/{project_id}", status_code=204)
+@router.delete(
+    "/{project_id}",
+    status_code=204,
+    dependencies=[Depends(require_faculty_project)],
+)
 def delete_project(project_id: int, db: Session = Depends(get_db)):
     project = db.get(Project, project_id)
     if project is None:
