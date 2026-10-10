@@ -7,19 +7,15 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.db.database import SessionLocal
+from app.auth.dependencies import get_db, require_faculty_project, require_project_access
 from app.db.models import DocumentAnalysis, Project, Submission
 from app.services.document_completeness import analyze_document_completeness
 
-router = APIRouter(prefix="/projects", tags=["Document Analysis"])
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+router = APIRouter(
+    prefix="/projects",
+    tags=["Document Analysis"],
+    dependencies=[Depends(require_project_access)],
+)
 
 
 class AnalyzeDocumentRequest(BaseModel):
@@ -70,6 +66,7 @@ def _safe_messages(messages: list[str]) -> list[str]:
 @router.post(
     "/{project_id}/submissions/{submission_id}/analyze",
     response_model=DocumentAnalysisResponse,
+    dependencies=[Depends(require_faculty_project)],
 )
 def analyze_submission_document(
     project_id: int,

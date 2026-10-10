@@ -1,6 +1,10 @@
-﻿from fastapi import FastAPI
+﻿from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
 
 from app.db.database import engine
+from app.core.config import settings
+from app.api_auth import router as auth_router
 from app.api_students import router as students_router
 from app.api_projects import router as projects_router
 from app.api_milestones import router as milestones_router
@@ -11,12 +15,20 @@ from app.api_uploads import router as uploads_router
 from app.api_submission_uploads import router as submission_uploads_router
 from app.api_document_analysis import router as document_analysis_router
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    settings.validate_production_auth_settings()
+    yield
+
+
 app = FastAPI(
     title="AI-Based Student Project Monitoring & Review Automation System",
     description="Backend API for monitoring student projects, milestones, and submissions.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
+app.include_router(auth_router)
 app.include_router(students_router)
 app.include_router(projects_router)
 app.include_router(milestones_router)

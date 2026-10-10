@@ -7,3 +7,7 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 pypdf
+argon2-cffi
+PyJWT
+email-validator
+httpx2
