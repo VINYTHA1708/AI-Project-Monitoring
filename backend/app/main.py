@@ -1,4 +1,4 @@
-﻿from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
@@ -14,6 +14,9 @@ from app.api_progress import router as progress_router
 from app.api_uploads import router as uploads_router
 from app.api_submission_uploads import router as submission_uploads_router
 from app.api_document_analysis import router as document_analysis_router
+from app.api_reviews import router as reviews_router
+from app.api_github import router as github_router
+from app.api_ai_summary import router as ai_summary_router
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -38,6 +41,10 @@ app.include_router(progress_router)
 app.include_router(uploads_router)
 app.include_router(submission_uploads_router)
 app.include_router(document_analysis_router)
+app.include_router(reviews_router)
+app.include_router(github_router)
+app.include_router(ai_summary_router)
+
 
 
 @app.get("/")

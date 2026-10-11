@@ -10,4 +10,3 @@ pypdf
 argon2-cffi
 PyJWT
 email-validator
-httpx2
