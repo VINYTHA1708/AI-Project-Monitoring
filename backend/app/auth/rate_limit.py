@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import status
@@ -12,6 +13,8 @@ from sqlalchemy.orm import Session
 from app.auth.service import AuthServiceError, _require_secret
 from app.core.config import settings
 from app.db.models import AuthRateLimitBucket
+
+logger = logging.getLogger(__name__)
 
 
 def _policy(action: str) -> tuple[int, int, int]:
@@ -112,7 +115,11 @@ def enforce_auth_rate_limit(
                 exceeded = exceeded or hit_count > limit
     except AuthServiceError:
         raise
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "Authentication rate limiting database failure: %s",
+            type(exc).__name__,
+        )
         db.rollback()
         raise AuthServiceError(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -124,3 +131,4 @@ def enforce_auth_rate_limit(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Too many authentication requests. Try again later.",
         )
+

@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -15,6 +16,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.db.models import AuthAccount, AuthOTPChallenge, Student
 from app.services.email_service import EmailServiceError, send_otp_email
+
+logger = logging.getLogger(__name__)
 
 password_hasher = PasswordHasher()
 OTP_WINDOW = timedelta(hours=1)
@@ -46,16 +49,35 @@ def _require_secret(name: str, value: str | None) -> bytes:
 
 
 def _faculty_is_approved(account: AuthAccount) -> bool:
-    return (
-        account.role == "faculty"
+    return bool(
+        account
+        and account.role == "faculty"
+        and account.email_verified
         and account.faculty_approved
-        and account.email in settings.faculty_email_allowlist
     )
 
 
 def _email_in_student_domain(email: str) -> bool:
-    domain = email.rsplit("@", 1)[-1]
-    return bool(settings.student_email_domains) and domain in settings.student_email_domains
+    if not email or not isinstance(email, str):
+        return False
+    clean_email = email.strip().lower()
+    if "@" not in clean_email:
+        return False
+    parts = clean_email.split("@")
+    if len(parts) != 2:
+        return False
+    local_part, domain = parts
+    if not local_part or not domain:
+        return False
+    if any(c.isspace() for c in local_part) or any(c.isspace() for c in domain):
+        return False
+    domain = domain.lstrip(".")
+    if "." not in domain:
+        return False
+    allowed = settings.student_email_domains
+    if not allowed:
+        return False
+    return domain in allowed
 
 
 def _new_challenge(
@@ -210,10 +232,20 @@ def _send_challenge(email: str, purpose: str, db: Session) -> None:
 
 
 def register_student(data, db: Session) -> None:
+    db_name = (
+        db.bind.url.database
+        if db.bind and hasattr(db.bind, "url") and db.bind.url
+        else "unknown"
+    )
     email = normalize_email(str(data.email))
     registration_number = data.registration_number.strip()
     normalized_registration = registration_number.casefold()
+
     if not _email_in_student_domain(email):
+        logger.warning(
+            "Student registration rejected on db=%s: domain disallowed for submitted email",
+            db_name,
+        )
         raise AuthServiceError(
             status.HTTP_400_BAD_REQUEST,
             "Use an email address from an approved student domain.",
@@ -235,6 +267,22 @@ def register_student(data, db: Session) -> None:
                         ),
                         {"key": key},
                     )
+
+            # Pre-check: Does an AuthAccount already exist for this email address?
+            existing_account = db.scalar(
+                select(AuthAccount).where(func.lower(AuthAccount.email) == email)
+            )
+            if existing_account is not None:
+                logger.warning(
+                    "Student registration rejected on db=%s: account already exists with this email address (existing_role=%s)",
+                    db_name,
+                    existing_account.role,
+                )
+                raise AuthServiceError(
+                    status.HTTP_409_CONFLICT,
+                    "An account already exists for this email address.",
+                )
+
             matches = db.scalars(
                 select(Student).where(
                     or_(
@@ -252,6 +300,10 @@ def register_student(data, db: Session) -> None:
                     != normalized_registration
                 )
             ):
+                logger.warning(
+                    "Student registration rejected on db=%s: email or registration number conflicts with existing student record",
+                    db_name,
+                )
                 raise AuthServiceError(
                     status.HTTP_409_CONFLICT,
                     "The email or registration number conflicts with an existing student record.",
@@ -259,10 +311,20 @@ def register_student(data, db: Session) -> None:
             if matches:
                 student = matches[0]
                 if student.auth_account is not None:
+                    logger.warning(
+                        "Student registration rejected on db=%s: student record already linked to an auth account (student_id=%s)",
+                        db_name,
+                        student.id,
+                    )
                     raise AuthServiceError(
                         status.HTTP_409_CONFLICT,
                         "An account already exists for this student.",
                     )
+                logger.info(
+                    "Student registration matched unlinked legacy student record on db=%s (student_id=%s)",
+                    db_name,
+                    student.id,
+                )
             else:
                 student = Student(
                     name=data.name.strip(),
@@ -271,6 +333,12 @@ def register_student(data, db: Session) -> None:
                 )
                 db.add(student)
                 db.flush()
+                logger.info(
+                    "Student registration created new student record on db=%s (student_id=%s)",
+                    db_name,
+                    student.id,
+                )
+
             account = AuthAccount(
                 role="student",
                 email=email,
@@ -281,8 +349,18 @@ def register_student(data, db: Session) -> None:
             )
             db.add(account)
             db.flush()
+            logger.info(
+                "Student registration successfully created account on db=%s (account_id=%s, role=student)",
+                db_name,
+                account.id,
+            )
     except IntegrityError as exc:
         db.rollback()
+        logger.warning(
+            "Student registration database integrity violation on db=%s: %s",
+            db_name,
+            exc.orig if hasattr(exc, "orig") else exc,
+        )
         raise AuthServiceError(
             status.HTTP_409_CONFLICT,
             "An account already exists for this email or student record.",
@@ -292,6 +370,11 @@ def register_student(data, db: Session) -> None:
 
 
 def register_faculty(data, db: Session) -> None:
+    db_name = (
+        db.bind.url.database
+        if db.bind and hasattr(db.bind, "url") and db.bind.url
+        else "unknown"
+    )
     email = normalize_email(str(data.email))
     account = AuthAccount(
         role="faculty",
@@ -304,10 +387,37 @@ def register_faculty(data, db: Session) -> None:
     )
     try:
         with db.begin():
+            existing_account = db.scalar(
+                select(AuthAccount).where(
+                    or_(
+                        func.lower(AuthAccount.email) == email,
+                        func.lower(AuthAccount.faculty_id) == data.faculty_id.strip().lower(),
+                    )
+                )
+            )
+            if existing_account is not None:
+                logger.warning(
+                    "Faculty registration duplicate rejected on db=%s: email or faculty_id already registered",
+                    db_name,
+                )
+                raise AuthServiceError(
+                    status.HTTP_409_CONFLICT,
+                    "An account already exists for this email or faculty ID.",
+                )
             db.add(account)
             db.flush()
+            logger.info(
+                "Faculty registration successfully created account on db=%s (account_id=%s, role=faculty)",
+                db_name,
+                account.id,
+            )
     except IntegrityError as exc:
         db.rollback()
+        logger.warning(
+            "Faculty registration database integrity violation on db=%s: %s",
+            db_name,
+            exc.orig if hasattr(exc, "orig") else exc,
+        )
         raise AuthServiceError(
             status.HTTP_409_CONFLICT,
             "An account already exists for this email or faculty ID.",
@@ -337,6 +447,11 @@ def resend_otp(email: str, purpose: str, db: Session) -> None:
 
 
 def begin_login(email: str, password: str, db: Session) -> None:
+    db_name = (
+        db.bind.url.database
+        if db.bind and hasattr(db.bind, "url") and db.bind.url
+        else "unknown"
+    )
     _require_secret("JWT_SECRET_KEY", settings.JWT_SECRET_KEY)
     normalized_email = normalize_email(email)
     if db.in_transaction():
@@ -383,17 +498,36 @@ def begin_login(email: str, password: str, db: Session) -> None:
                 account.failed_login_count = 0
                 account.locked_until = None
                 if not account.email_verified:
+                    logger.warning(
+                        "Login rejected on db=%s: email unverified (role=%s, account_id=%s)",
+                        db_name,
+                        account.role,
+                        account.id,
+                    )
                     error = AuthServiceError(
                         status.HTTP_403_FORBIDDEN,
                         "Verify your email address before signing in.",
                     )
                 elif account.role == "faculty" and not _faculty_is_approved(account):
+                    logger.warning(
+                        "Faculty login rejected on db=%s: access pending approval (account_id=%s, email_verified=%s, faculty_approved=%s)",
+                        db_name,
+                        account.id,
+                        bool(account.email_verified),
+                        bool(account.faculty_approved),
+                    )
                     error = AuthServiceError(
                         status.HTTP_403_FORBIDDEN,
                         "Faculty access is pending approval.",
                     )
                 else:
                     permitted = True
+                    logger.info(
+                        "Login approved credentials on db=%s (role=%s, account_id=%s)",
+                        db_name,
+                        account.role,
+                        account.id,
+                    )
     if error:
         raise error
     if not permitted:

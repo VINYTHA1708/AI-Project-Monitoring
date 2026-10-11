@@ -14,8 +14,12 @@ class Settings(BaseSettings):
 
     GROQ_API_KEY: str | None = None
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GEMINI_API_KEY: str | None = None
+    GEMINI_MODEL: str = "gemini-1.5-flash"
+    LLM_PROVIDER: str = "groq"
+    GITHUB_TOKEN: str | None = None
 
-    STUDENT_EMAIL_DOMAINS: str = ""
+    STUDENT_EMAIL_DOMAINS: str = "vitstudent.ac.in,university.edu"
     FACULTY_EMAIL_ALLOWLIST: str = ""
     JWT_SECRET_KEY: str | None = None
     OTP_HMAC_SECRET: str | None = None
@@ -46,13 +50,13 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_file=".env",
-        env_file_encoding="utf-8",
+        env_file_encoding="utf-8-sig",  # utf-8-sig strips the BOM that Windows tools add
     )
 
     @property
     def student_email_domains(self) -> set[str]:
         return {
-            domain.strip().lower().lstrip("@")
+            domain.strip().lower().lstrip("@").lstrip(".")
             for domain in self.STUDENT_EMAIL_DOMAINS.split(",")
             if domain.strip()
         }
@@ -90,6 +94,12 @@ class Settings(BaseSettings):
             )
         if self.JWT_SECRET_KEY == self.OTP_HMAC_SECRET:
             raise ValueError("JWT_SECRET_KEY and OTP_HMAC_SECRET must be different.")
+        if not self.DATABASE_URL or not self.DATABASE_URL.strip().lower().startswith(
+            ("postgresql://", "postgresql+psycopg2://")
+        ):
+            raise ValueError(
+                "Production requires a PostgreSQL database (DATABASE_URL must start with postgresql:// or postgresql+psycopg2://)."
+            )
 
 
 settings = Settings()
