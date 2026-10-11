@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 import zipfile
@@ -145,7 +145,7 @@ async def upload_submission(
             presentation_path=presentation_path,
             srs_path=srs_path,
             notes=notes,
-            submitted_at=datetime.now(),
+            submitted_at=datetime.now(timezone.utc),
             status="SUBMITTED",
         )
 

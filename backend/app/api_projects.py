@@ -1,4 +1,4 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy.orm import Session
 
@@ -10,7 +10,7 @@ from app.auth.dependencies import (
     require_project_access,
     require_roles,
 )
-from app.db.models import FacultyProjectAssignment, Project, ProjectMember
+from app.db.models import AuthAccount, FacultyProjectAssignment, Project, ProjectMember
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
@@ -21,25 +21,68 @@ class ProjectCreate(BaseModel):
     github_url: HttpUrl | None = None
 
 
+class FacultySupervisorResponse(BaseModel):
+    name: str
+    email: str
+    department: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ProjectResponse(BaseModel):
     id: int
     title: str
     description: str | None
     github_url: str | None
     status: str
+    supervisors: list[FacultySupervisorResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+def _get_project_supervisors(project_id: int, db: Session) -> list[FacultySupervisorResponse]:
+    assignments = (
+        db.query(AuthAccount)
+        .join(
+            FacultyProjectAssignment,
+            FacultyProjectAssignment.faculty_account_id == AuthAccount.id,
+        )
+        .filter(
+            FacultyProjectAssignment.project_id == project_id,
+            AuthAccount.role == "faculty",
+            AuthAccount.faculty_approved.is_(True),
+        )
+        .all()
+    )
+    return [
+        FacultySupervisorResponse(
+            name=acc.faculty_name or "Faculty Supervisor",
+            email=acc.email,
+            department=acc.department,
+        )
+        for acc in assignments
+    ]
+
+
+def _project_payload(project: Project, db: Session) -> dict:
+    return {
+        "id": project.id,
+        "title": project.title,
+        "description": project.description,
+        "github_url": project.github_url,
+        "status": project.status,
+        "supervisors": _get_project_supervisors(project.id, db),
+    }
 
 
 @router.post(
     "/",
     response_model=ProjectResponse,
     status_code=201,
-    dependencies=[Depends(require_roles("faculty"))],
 )
 def create_project(
     data: ProjectCreate,
-    account: Principal = Depends(require_roles("faculty")),
+    account: Principal = Depends(get_current_account),
     db: Session = Depends(get_db),
 ):
     project = Project(
@@ -49,15 +92,24 @@ def create_project(
     )
     db.add(project)
     db.flush()
-    db.add(
-        FacultyProjectAssignment(
-            faculty_account_id=account.id,
-            project_id=project.id,
+    if account.role == "faculty":
+        db.add(
+            FacultyProjectAssignment(
+                faculty_account_id=account.id,
+                project_id=project.id,
+            )
         )
-    )
+    elif account.role == "student" and account.student_id:
+        db.add(
+            ProjectMember(
+                project_id=project.id,
+                student_id=account.student_id,
+                role="LEADER",
+            )
+        )
     db.commit()
     db.refresh(project)
-    return project
+    return _project_payload(project, db)
 
 
 @router.get("/", response_model=list[ProjectResponse])
@@ -80,7 +132,8 @@ def list_projects(
             .join(ProjectMember, ProjectMember.project_id == Project.id)
             .filter(ProjectMember.student_id == account.student_id)
         )
-    return query.order_by(Project.id).all()
+    projects = query.order_by(Project.id).all()
+    return [_project_payload(project, db) for project in projects]
 
 
 @router.get(
@@ -92,13 +145,13 @@ def get_project(project_id: int, db: Session = Depends(get_db)):
     project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-    return project
+    return _project_payload(project, db)
 
 
 @router.put(
     "/{project_id}",
     response_model=ProjectResponse,
-    dependencies=[Depends(require_faculty_project)],
+    dependencies=[Depends(require_project_access)],
 )
 def update_project(
     project_id: int,
@@ -115,7 +168,7 @@ def update_project(
 
     db.commit()
     db.refresh(project)
-    return project
+    return _project_payload(project, db)
 
 
 @router.delete(

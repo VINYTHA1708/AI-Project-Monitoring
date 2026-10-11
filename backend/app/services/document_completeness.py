@@ -35,6 +35,32 @@ DOCUMENT_SECTION_MAP = {
 }
 
 
+SECTION_RATIONALES: dict[str, str] = {
+    "Abstract": "Provides an executive summary of the project scope, methodology, and key contributions.",
+    "Introduction": "Establishes contextual background, project significance, and core motivations.",
+    "Problem Statement": "Articulates the specific technical problem or research challenge being solved.",
+    "Objectives": "Defines clear, measurable project targets and expected milestones.",
+    "Methodology": "Describes the technical strategy, design principles, and engineering workflow.",
+    "Implementation": "Documents concrete software engineering artifacts, tools, and technical details.",
+    "Results and Discussion": "Presents empirical evaluation, validation metrics, and critical discussion.",
+    "Conclusion": "Summarizes project outcomes, highlights impact, and outlines future enhancements.",
+    "References": "Credits academic sources and technical foundations to ensure academic integrity.",
+    "Purpose and Scope": "Defines software product boundaries, stakeholders, and high-level objectives.",
+    "Overall Description": "Provides high-level system perspective, operational context, and user constraints.",
+    "Functional Requirements": "Specifies concrete system behaviors, functional capabilities, inputs, and outputs.",
+    "Non-Functional Requirements": "Defines performance benchmarks, security expectations, and quality standards.",
+    "System Requirements": "Specifies hardware, software, runtime environment, and dependency prerequisites.",
+    "Use Cases": "Maps out user interaction scenarios, operational flows, and functional behaviors.",
+    "Constraints": "Identifies architectural limits, regulatory requirements, and technical boundaries.",
+}
+
+ANALYSIS_LIMITATION_DISCLAIMER = (
+    "Structural completeness analysis verifies the presence of recognized section headings "
+    "and document length. It does not verify the technical accuracy, semantic depth, "
+    "or substantive correctness of the content."
+)
+
+
 def get_required_sections(
     document_type: str,
     required_sections: list[str] | None = None,
@@ -77,7 +103,9 @@ def _build_section_variants(section_name: str) -> set[str]:
 
 def _is_heading_like(line: str, allowed_aliases: set[str]) -> bool:
     cleaned = re.sub(r"^[-*•\s]+", "", line.strip())
-    cleaned = re.sub(r"^\d+[\.)]?\s*", "", cleaned)
+    cleaned = re.sub(r"^(?:chapter|section|part|module)\s+[\w\d]+[:.\-]?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^[0-9]+(?:\.[0-9]+)*[\.)\-]?\s*", "", cleaned)
+    cleaned = re.sub(r"^[ivxlcdm]+[\.)\-]\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.strip()
 
     if not cleaned:
@@ -151,6 +179,16 @@ def analyze_document_completeness(
             "completeness_percentage": None,
             "detected_sections": [],
             "missing_sections": section_requirements[:],
+            "missing_section_details": [
+                {
+                    "section": s,
+                    "rationale": SECTION_RATIONALES.get(
+                        s, "Standard academic requirement for this document type."
+                    ),
+                }
+                for s in section_requirements
+            ],
+            "limitation_disclaimer": ANALYSIS_LIMITATION_DISCLAIMER,
             "page_count": extraction_result.get("page_count", 0),
             "word_count": extraction_result.get("word_count", 0),
             "warnings": warnings,
@@ -167,6 +205,16 @@ def analyze_document_completeness(
             "completeness_percentage": None,
             "detected_sections": [],
             "missing_sections": section_requirements[:],
+            "missing_section_details": [
+                {
+                    "section": s,
+                    "rationale": SECTION_RATIONALES.get(
+                        s, "Standard academic requirement for this document type."
+                    ),
+                }
+                for s in section_requirements
+            ],
+            "limitation_disclaimer": ANALYSIS_LIMITATION_DISCLAIMER,
             "page_count": extraction_result.get("page_count", 0),
             "word_count": extraction_result.get("word_count", 0),
             "warnings": warnings,
@@ -196,12 +244,24 @@ def analyze_document_completeness(
         "complete" if completeness_percentage == 100 else "incomplete"
     )
 
+    missing_section_details = [
+        {
+            "section": s,
+            "rationale": SECTION_RATIONALES.get(
+                s, "Standard academic requirement for this document type."
+            ),
+        }
+        for s in missing_sections
+    ]
+
     return {
         "document_type": document_type,
         "analysis_status": analysis_status,
         "completeness_percentage": completeness_percentage,
         "detected_sections": detected_sections,
         "missing_sections": missing_sections,
+        "missing_section_details": missing_section_details,
+        "limitation_disclaimer": ANALYSIS_LIMITATION_DISCLAIMER,
         "page_count": page_count,
         "word_count": word_count,
         "warnings": warnings,

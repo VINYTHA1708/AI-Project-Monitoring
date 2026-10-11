@@ -4,11 +4,22 @@ from app.db.database import engine
 
 
 def test_connection():
-    with engine.connect() as connection:
-        result = connection.execute(text("SELECT current_database()"))
-        database_name = result.scalar_one()
+    """Verify database connectivity with a dialect-neutral probe query.
 
-        print(f"Connected successfully to: {database_name}")
+    Uses SELECT 1 instead of the PostgreSQL-specific SELECT current_database()
+    so that the smoke test works against both SQLite (for tests) and PostgreSQL
+    (for development/production).  Connection metadata is read from the engine
+    URL rather than from a database-specific function.
+    """
+    url = engine.url
+    dialect = url.get_dialect().name
+    # Report the database name from the URL; for SQLite this is the file path.
+    database_name = str(url.database or "(none)")
+
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+
+    print(f"Connected successfully. dialect={dialect} database={database_name}")
 
 
 if __name__ == "__main__":

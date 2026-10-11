@@ -2,6 +2,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,7 +17,8 @@ router = APIRouter(
 
 
 class MemberCreate(BaseModel):
-    student_id: int
+    student_id: int | None = None
+    registration_number: str | None = None
     role: Literal["MEMBER"] = "MEMBER"
 
 
@@ -33,7 +35,7 @@ class MemberResponse(BaseModel):
     "/",
     response_model=MemberResponse,
     status_code=201,
-    dependencies=[Depends(require_faculty_project)],
+    dependencies=[Depends(require_project_access)],
 )
 def add_member(
     project_id: int,
@@ -43,12 +45,24 @@ def add_member(
     if db.get(Project, project_id) is None:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    if db.get(Student, data.student_id) is None:
-        raise HTTPException(status_code=404, detail="Student not found")
+    target_student = None
+    if data.student_id is not None:
+        target_student = db.get(Student, data.student_id)
+    elif data.registration_number:
+        clean_reg = data.registration_number.strip().upper()
+        target_student = db.query(Student).filter(
+            func.upper(func.trim(Student.registration_number)) == clean_reg
+        ).first()
+
+    if target_student is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Student not found. Provide a valid student ID or registration number.",
+        )
 
     existing = db.query(ProjectMember).filter_by(
         project_id=project_id,
-        student_id=data.student_id,
+        student_id=target_student.id,
     ).first()
 
     if existing:
@@ -59,9 +73,10 @@ def add_member(
 
     member = ProjectMember(
         project_id=project_id,
-        student_id=data.student_id,
+        student_id=target_student.id,
         role=data.role,
     )
+
     db.add(member)
 
     try:
@@ -90,7 +105,7 @@ def list_members(project_id: int, db: Session = Depends(get_db)):
 @router.delete(
     "/{student_id}",
     status_code=204,
-    dependencies=[Depends(require_faculty_project)],
+    dependencies=[Depends(require_project_access)],
 )
 def remove_member(
     project_id: int,
