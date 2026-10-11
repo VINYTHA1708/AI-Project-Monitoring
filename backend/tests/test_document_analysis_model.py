@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -61,7 +61,7 @@ def test_document_analysis_model_fields_and_fk(db_session):
         word_count=1200,
         warnings=["Short document"],
         extraction_errors=[],
-        analyzed_at=datetime.utcnow(),
+        analyzed_at=datetime.now(timezone.utc),
     )
     db_session.add(analysis)
     db_session.commit()
@@ -115,7 +115,7 @@ def test_document_analysis_enforces_unique_submission_type(db_session):
         word_count=500,
         warnings=[],
         extraction_errors=[],
-        analyzed_at=datetime.utcnow(),
+        analyzed_at=datetime.now(timezone.utc),
     )
     second = DocumentAnalysis(
         submission_id=submission.id,
@@ -128,7 +128,7 @@ def test_document_analysis_enforces_unique_submission_type(db_session):
         word_count=650,
         warnings=[],
         extraction_errors=[],
-        analyzed_at=datetime.utcnow(),
+        analyzed_at=datetime.now(timezone.utc),
     )
 
     db_session.add(first)

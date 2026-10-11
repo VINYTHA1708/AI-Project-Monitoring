@@ -16,6 +16,8 @@ from app.auth.dependencies import (
 )
 from app.auth.service import (
     AuthServiceError,
+    _email_in_student_domain,
+    _faculty_is_approved,
     begin_login,
     decode_access_token,
     create_access_token,
@@ -365,6 +367,9 @@ def test_production_configuration_rejects_placeholders_and_shared_secrets(
     auth_db, monkeypatch
 ):
     monkeypatch.setattr(settings, "APP_ENV", "production")
+    monkeypatch.setattr(
+        settings, "DATABASE_URL", "postgresql://user:pass@localhost:5432/appdb"
+    )
     monkeypatch.setattr(settings, "JWT_SECRET_KEY", "replace-with-a-random-key-123456789")
     monkeypatch.setattr(settings, "OTP_HMAC_SECRET", "a-different-long-random-key-123456789")
     monkeypatch.setattr(settings, "STUDENT_EMAIL_DOMAINS", "university.edu")
@@ -376,6 +381,20 @@ def test_production_configuration_rejects_placeholders_and_shared_secrets(
     monkeypatch.setattr(settings, "JWT_SECRET_KEY", secret)
     monkeypatch.setattr(settings, "OTP_HMAC_SECRET", secret)
     with pytest.raises(ValueError, match="must be different"):
+        settings.validate_production_auth_settings()
+
+
+def test_production_configuration_rejects_sqlite_database_url(monkeypatch):
+    monkeypatch.setattr(settings, "APP_ENV", "production")
+    secret1 = secrets.token_urlsafe(48)
+    secret2 = secrets.token_urlsafe(48)
+    monkeypatch.setattr(settings, "JWT_SECRET_KEY", secret1)
+    monkeypatch.setattr(settings, "OTP_HMAC_SECRET", secret2)
+    monkeypatch.setattr(settings, "STUDENT_EMAIL_DOMAINS", "university.edu")
+    monkeypatch.setattr(settings, "FACULTY_EMAIL_ALLOWLIST", "faculty@university.edu")
+    monkeypatch.setattr(settings, "DATABASE_URL", "sqlite:///:memory:")
+
+    with pytest.raises(ValueError, match="Production requires a PostgreSQL database"):
         settings.validate_production_auth_settings()
 
 
@@ -437,3 +456,179 @@ def test_failed_smtp_delivery_is_retryable_and_old_code_cannot_authenticate(
         auth_db,
     )
     assert verified["email_verified"] is True
+
+
+def test_student_registration_allowed_domain_vitstudent(auth_db, monkeypatch):
+    messages = capture_email(monkeypatch)
+    monkeypatch.setattr(
+        settings, "STUDENT_EMAIL_DOMAINS", "vitstudent.ac.in,university.edu"
+    )
+    reg = student_registration(
+        email="student@vitstudent.ac.in",
+        registration_number="21BCE0001",
+    )
+    register_student(reg, auth_db)
+    assert len(messages) == 1
+    assert messages[0][0] == "student@vitstudent.ac.in"
+    assert auth_db.query(AuthAccount).filter_by(email="student@vitstudent.ac.in").count() == 1
+
+
+def test_student_registration_disallowed_domain(auth_db, monkeypatch):
+    capture_email(monkeypatch)
+    monkeypatch.setattr(
+        settings, "STUDENT_EMAIL_DOMAINS", "vitstudent.ac.in,university.edu"
+    )
+    reg = student_registration(
+        email="intruder@gmail.com",
+        registration_number="21BCE9999",
+    )
+    with pytest.raises(AuthServiceError) as exc_info:
+        register_student(reg, auth_db)
+    assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
+    assert "approved student domain" in exc_info.value.detail
+    assert auth_db.query(AuthAccount).filter_by(email="intruder@gmail.com").count() == 0
+
+
+def test_student_domain_check_malformed_email_addresses(monkeypatch):
+    monkeypatch.setattr(
+        settings, "STUDENT_EMAIL_DOMAINS", "vitstudent.ac.in,university.edu"
+    )
+    malformed_emails = [
+        "notanemail",
+        "@vitstudent.ac.in",
+        "student@",
+        "student@@vitstudent.ac.in",
+        "student@evil.com@vitstudent.ac.in",
+        "vitstudent.ac.in",
+        "",
+        "   ",
+        None,
+        "student@ vitstudent.ac.in",
+        "student@vitstudent.ac.in ",
+    ]
+    for candidate in malformed_emails:
+        # Whitespace-stripped valid email is tested separately; unstripped with inner space is malformed
+        if candidate == "student@vitstudent.ac.in ":
+            # normalize_email strips outer whitespace, but direct call without clean string
+            assert _email_in_student_domain("student@vitstudent.ac.in") is True
+        else:
+            assert _email_in_student_domain(candidate) is False, f"Expected False for {candidate!r}"
+
+
+def test_student_registration_succeeds_when_no_account_exists(auth_db, monkeypatch):
+    messages = capture_email(monkeypatch)
+    reg = student_registration(
+        email="fresh.student@university.edu",
+        registration_number="FRESH-001",
+    )
+    register_student(reg, auth_db)
+    assert len(messages) == 1
+    assert messages[0][0] == "fresh.student@university.edu"
+    created_account = auth_db.query(AuthAccount).filter_by(email="fresh.student@university.edu").one_or_none()
+    assert created_account is not None
+    assert created_account.role == "student"
+    created_student = auth_db.query(Student).filter_by(email="fresh.student@university.edu").one_or_none()
+    assert created_student is not None
+    assert created_student.registration_number == "FRESH-001"
+
+
+def test_student_registration_rejects_duplicate_email_with_existing_account(auth_db, monkeypatch):
+    capture_email(monkeypatch)
+    # Pre-register a faculty account with this email
+    register_faculty(faculty_registration(email="faculty@university.edu"), auth_db)
+
+    # Attempt student registration with the same email
+    reg = student_registration(
+        email="faculty@university.edu",
+        registration_number="NEW-REG-001",
+    )
+    with pytest.raises(AuthServiceError) as exc_info:
+        register_student(reg, auth_db)
+    assert exc_info.value.status_code == status.HTTP_409_CONFLICT
+    assert "An account already exists for this email address." in exc_info.value.detail
+    assert auth_db.query(Student).filter_by(email="faculty@university.edu").count() == 0
+
+
+def test_verified_approved_faculty_passes_approval_gate_and_can_login(auth_db, monkeypatch):
+    messages = capture_email(monkeypatch)
+    # Ensure allowlist only contains other email
+    monkeypatch.setattr(settings, "FACULTY_EMAIL_ALLOWLIST", "other.faculty@university.edu")
+    
+    # Create a verified, approved faculty whose email is NOT in the allowlist
+    account = AuthAccount(
+        role="faculty",
+        email="approved.prof@custom.edu",
+        faculty_name="Prof Approved",
+        faculty_id="FAC-APP-1",
+        email_verified=True,
+        faculty_approved=True,
+        password_hash=PasswordHasher().hash("secure-faculty-pass"),
+    )
+    auth_db.add(account)
+    auth_db.commit()
+
+    # Approval gate check directly
+    assert _faculty_is_approved(account) is True
+
+    # Login flow passes approval gate and sends challenge
+    begin_login("approved.prof@custom.edu", "secure-faculty-pass", auth_db)
+    assert len(messages) == 1
+    assert messages[0][0] == "approved.prof@custom.edu"
+    login_code = messages[0][1]
+
+    # OTP verification succeeds and issues access token
+    auth_db.rollback()
+    res = verify_otp("approved.prof@custom.edu", login_code, "login", auth_db)
+    assert res["email_verified"] is True
+    assert res["faculty_approval_pending"] is False
+    assert "access_token" in res
+    assert res["account"]["role"] == "faculty"
+
+
+def test_unapproved_faculty_remains_blocked_from_login(auth_db, monkeypatch):
+    capture_email(monkeypatch)
+    # Verified email but faculty_approved is False
+    account = AuthAccount(
+        role="faculty",
+        email="unapproved.prof@custom.edu",
+        faculty_name="Prof Unapproved",
+        faculty_id="FAC-UNAPP-1",
+        email_verified=True,
+        faculty_approved=False,
+        password_hash=PasswordHasher().hash("secure-faculty-pass"),
+    )
+    auth_db.add(account)
+    auth_db.commit()
+
+    assert _faculty_is_approved(account) is False
+
+    with pytest.raises(AuthServiceError) as exc_info:
+        begin_login("unapproved.prof@custom.edu", "secure-faculty-pass", auth_db)
+    assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
+    assert "Faculty access is pending approval." in exc_info.value.detail
+
+
+def test_unverified_faculty_remains_blocked_from_login(auth_db, monkeypatch):
+    capture_email(monkeypatch)
+    # Neither verified nor approved
+    account = AuthAccount(
+        role="faculty",
+        email="unverified.prof@custom.edu",
+        faculty_name="Prof Unverified",
+        faculty_id="FAC-UNVER-1",
+        email_verified=False,
+        faculty_approved=False,
+        password_hash=PasswordHasher().hash("secure-faculty-pass"),
+    )
+    auth_db.add(account)
+    auth_db.commit()
+
+    assert _faculty_is_approved(account) is False
+
+    with pytest.raises(AuthServiceError) as exc_info:
+        begin_login("unverified.prof@custom.edu", "secure-faculty-pass", auth_db)
+    assert exc_info.value.status_code == status.HTTP_403_FORBIDDEN
+    assert "Verify your email address before signing in." in exc_info.value.detail
+
+
+

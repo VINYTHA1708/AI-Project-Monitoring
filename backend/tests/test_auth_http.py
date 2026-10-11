@@ -472,3 +472,62 @@ def test_http_submission_deletion_requires_assigned_faculty_and_project_ownershi
     assert deleted.status_code == 204
     db.expire_all()
     assert db.get(Submission, submission_id) is None
+
+
+def test_http_student_registration_allowed_domain_vitstudent(http_context, monkeypatch):
+    client, db = http_context
+    sent = []
+    monkeypatch.setattr(
+        "app.auth.service.send_otp_email",
+        lambda email, code: sent.append((email, code)),
+    )
+    monkeypatch.setattr(
+        settings, "STUDENT_EMAIL_DOMAINS", "vitstudent.ac.in,university.edu"
+    )
+    payload = {
+        "name": "VIT Student",
+        "registration_number": "21BCE2001",
+        "email": "student@vitstudent.ac.in",
+        "phone": "+91 9876543210",
+        "department": "Scope",
+        "password": "a-long-test-password-123",
+    }
+    response = client.post("/auth/register/student", json=payload)
+    assert response.status_code == 202
+    assert response.json()["email"] == "student@vitstudent.ac.in"
+    assert len(sent) == 1
+    assert sent[0][0] == "student@vitstudent.ac.in"
+    assert db.query(AuthAccount).filter_by(email="student@vitstudent.ac.in").count() == 1
+
+
+def test_http_student_registration_disallowed_domain(http_context, monkeypatch):
+    client, db = http_context
+    monkeypatch.setattr(
+        settings, "STUDENT_EMAIL_DOMAINS", "vitstudent.ac.in,university.edu"
+    )
+    payload = {
+        "name": "External Student",
+        "registration_number": "EXT-100",
+        "email": "external@gmail.com",
+        "phone": "+1 555 0100",
+        "department": "External",
+        "password": "a-long-test-password-123",
+    }
+    response = client.post("/auth/register/student", json=payload)
+    assert response.status_code == 400
+    assert "approved student domain" in response.json()["detail"]
+    assert db.query(AuthAccount).filter_by(email="external@gmail.com").count() == 0
+
+
+def test_http_student_registration_malformed_email(http_context):
+    client, _db = http_context
+    payload = {
+        "name": "Invalid Email Student",
+        "registration_number": "INV-100",
+        "email": "not-a-valid-email-string",
+        "phone": "+1 555 0100",
+        "department": "Computing",
+        "password": "a-long-test-password-123",
+    }
+    response = client.post("/auth/register/student", json=payload)
+    assert response.status_code == 422
