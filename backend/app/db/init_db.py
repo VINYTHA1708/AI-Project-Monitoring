@@ -6,6 +6,9 @@ MIGRATION_MANAGED_TABLES = {
     "auth_otp_challenges",
     "auth_rate_limit_buckets",
     "faculty_project_assignments",
+    "submission_reviews",
+    "github_analysis_snapshots",
+    "project_ai_summaries",
 }
 
 

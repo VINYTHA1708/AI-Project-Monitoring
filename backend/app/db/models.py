@@ -7,6 +7,7 @@ from sqlalchemy import (
     Date,
     ForeignKey,
     Integer,
+    Float,
     Boolean,
     JSON,
     CheckConstraint,
@@ -34,7 +35,9 @@ class Student(Base):
         String(50), unique=True, nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
     auth_account: Mapped["AuthAccount | None"] = relationship(
         back_populates="student",
@@ -53,7 +56,18 @@ class Project(Base):
         String(30), default="ACTIVE", nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    github_analyses: Mapped[list["GitHubAnalysisSnapshot"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+    )
+    ai_summaries: Mapped[list["ProjectAISummary"]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
     )
 
 
@@ -104,7 +118,9 @@ class Submission(Base):
     )
     srs_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
     status: Mapped[str] = mapped_column(
         String(30), default="SUBMITTED", nullable=False
@@ -112,6 +128,10 @@ class Submission(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     document_analyses: Mapped[list["DocumentAnalysis"]] = relationship(
+        back_populates="submission",
+        cascade="all, delete-orphan",
+    )
+    reviews: Mapped[list["SubmissionReview"]] = relationship(
         back_populates="submission",
         cascade="all, delete-orphan",
     )
@@ -160,7 +180,9 @@ class DocumentAnalysis(Base):
         JSON, nullable=True
     )
     analyzed_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, nullable=False
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
 
     submission: Mapped[Submission] = relationship(
@@ -408,3 +430,113 @@ class FacultyProjectAssignment(Base):
         default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
+
+
+class SubmissionReview(Base):
+    __tablename__ = "submission_reviews"
+    __table_args__ = (
+        CheckConstraint(
+            "score >= 0.0 AND score <= 100.0",
+            name="ck_submission_reviews_score_range",
+        ),
+        CheckConstraint(
+            "trim(feedback) <> ''",
+            name="ck_submission_reviews_feedback_not_empty",
+        ),
+        UniqueConstraint(
+            "submission_id",
+            "faculty_account_id",
+            name="uq_submission_reviews_submission_faculty",
+        ),
+        Index("ix_submission_reviews_project", "project_id"),
+        Index("ix_submission_reviews_submission", "submission_id"),
+        Index("ix_submission_reviews_faculty", "faculty_account_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    submission_id: Mapped[int] = mapped_column(
+        ForeignKey("submissions.id", ondelete="CASCADE"), nullable=False
+    )
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    faculty_account_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    feedback: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    submission: Mapped[Submission] = relationship(back_populates="reviews")
+    faculty_account: Mapped["AuthAccount"] = relationship()
+    project: Mapped["Project"] = relationship()
+
+
+class GitHubAnalysisSnapshot(Base):
+    """Persisted snapshot of repository activity, contribution indicators, and member matches."""
+
+    __tablename__ = "github_analysis_snapshots"
+    __table_args__ = (
+        Index("ix_github_analysis_project", "project_id"),
+        Index("ix_github_analysis_analyzed_at", "analyzed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    repo_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    total_commits: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    contributor_stats: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
+    recent_activity: Mapped[list[dict] | dict | None] = mapped_column(JSON, nullable=True)
+    limitations_disclaimer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analyzed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    project: Mapped["Project"] = relationship(back_populates="github_analyses")
+
+
+class ProjectAISummary(Base):
+    """Persisted advisory AI-generated project summary derived from verifiable project evidence."""
+
+    __tablename__ = "project_ai_summaries"
+    __table_args__ = (
+        Index("ix_project_ai_summaries_project", "project_id"),
+        Index("ix_project_ai_summaries_created_at", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False)
+    key_points: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    risks: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    recommended_next_steps: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    review_questions: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    evidence_sources: Mapped[list[dict] | dict | None] = mapped_column(JSON, nullable=True)
+    advisory_disclaimer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    project: Mapped["Project"] = relationship(back_populates="ai_summaries")
+
+
