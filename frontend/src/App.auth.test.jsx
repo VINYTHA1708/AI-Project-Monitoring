@@ -97,8 +97,8 @@ describe("faculty authentication", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Verify email" }));
 
-    await screen.findByText("No projects yet");
-    expect(screen.getByRole("heading", { name: "Submissions" })).toBeTruthy();
+    await screen.findByText("No assigned projects");
+    expect(screen.getByRole("heading", { name: "Submission Reviews", level: 1 })).toBeTruthy();
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/projects/",
       expect.objectContaining({
