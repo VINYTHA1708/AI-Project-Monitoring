@@ -113,10 +113,19 @@ class Submission(Base):
     )
     week_number: Mapped[int] = mapped_column(Integer, nullable=False)
     report_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    report_original_name: Mapped[str | None] = mapped_column(
+        String(500), nullable=True
+    )
     presentation_path: Mapped[str | None] = mapped_column(
         String(500), nullable=True
     )
+    presentation_original_name: Mapped[str | None] = mapped_column(
+        String(500), nullable=True
+    )
     srs_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    srs_original_name: Mapped[str | None] = mapped_column(
+        String(500), nullable=True
+    )
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -531,6 +540,21 @@ class ProjectAISummary(Base):
     review_questions: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     evidence_sources: Mapped[list[dict] | dict | None] = mapped_column(JSON, nullable=True)
     advisory_disclaimer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_relevance: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    detected_document_topic: Mapped[str | None] = mapped_column(Text, nullable=True)
+    assigned_project_topic: Mapped[str | None] = mapped_column(Text, nullable=True)
+    relevance_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    supporting_evidence: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    relevant_findings: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    missing_evidence: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    progress_assessment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    document_results: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
+    submission_verification_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    relevant_documents_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    partially_relevant_documents_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unrelated_documents_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    insufficient_content_documents_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -538,5 +562,52 @@ class ProjectAISummary(Base):
     )
 
     project: Mapped["Project"] = relationship(back_populates="ai_summaries")
+
+
+class DocumentRelevanceAnalysis(Base):
+    """Persisted independent relevance verification for an uploaded submission deliverable."""
+
+    __tablename__ = "document_relevance_analyses"
+    __table_args__ = (
+        UniqueConstraint(
+            "submission_id",
+            "file_type",
+            name="uq_document_relevance_submission_file_type",
+        ),
+        Index("ix_doc_relevance_project", "project_id"),
+        Index("ix_doc_relevance_submission", "submission_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    submission_id: Mapped[int] = mapped_column(
+        ForeignKey("submissions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    document_identifier: Mapped[str] = mapped_column(String(100), nullable=False)
+    file_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    document_title: Mapped[str] = mapped_column(String(500), default="Not extractable", nullable=False)
+    document_headings: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    detected_document_topic: Mapped[str] = mapped_column(Text, nullable=False)
+    assigned_project_title: Mapped[str] = mapped_column(Text, nullable=False)
+    title_match_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_match_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_relevance: Mapped[str] = mapped_column(String(40), nullable=False)
+    supporting_evidence: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    conflicting_evidence: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    missing_evidence: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    recommended_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    analyzed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    project: Mapped["Project"] = relationship()
+    submission: Mapped["Submission"] = relationship()
 
 

@@ -91,6 +91,12 @@ psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f .\migrations\0002_submission_review
 
 # 3. GitHub analysis snapshots & AI synthesis records
 psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f .\migrations\0003_github_and_ai_summaries.sql
+
+# 4. Document relevance detection & semantic evidence columns
+psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f .\migrations\0004_ai_summary_relevance.sql
+
+# 5. Multi-deliverable independent relevance analyses & verification status
+psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f .\migrations\0005_document_relevance_analyses.sql
 ```
 
 > **Note on Migration Safety:** Never execute migrations against an unverified production database. Always verify backups first as outlined in `backend/migrations/README.md`.

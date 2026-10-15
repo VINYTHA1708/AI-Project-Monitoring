@@ -60,6 +60,56 @@ forwarded headers.
    psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -c "SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = current_schema() AND tablename IN ('auth_accounts', 'auth_otp_challenges', 'auth_rate_limit_buckets', 'faculty_project_assignments') ORDER BY tablename, indexname"
    ```
 
+## Additive Phase Migrations
+
+### `0002_submission_reviews.sql`
+Adds the `submission_reviews` table for faculty rubric scoring and feedback, with foreign keys to `projects`, `submissions`, and `auth_accounts`.
+
+### `0003_github_and_ai_summaries.sql`
+Adds `github_analysis_snapshots` and `project_ai_summaries` tables for persistent GitHub commit snapshots and LLM advisory summaries.
+
+### `0004_ai_summary_relevance.sql`
+Adds semantic document relevance columns to `project_ai_summaries` via `ALTER TABLE project_ai_summaries ADD COLUMN IF NOT EXISTS`:
+- `document_relevance` (VARCHAR)
+- `detected_document_topic` (TEXT)
+- `assigned_project_topic` (TEXT)
+- `relevance_explanation` (TEXT)
+- `supporting_evidence` (JSONB)
+- `relevant_findings` (JSONB)
+- `missing_evidence` (JSONB)
+- `progress_assessment` (TEXT)
+- `confidence` (DOUBLE PRECISION)
+
+### `0005_document_relevance_analyses.sql`
+Adds the `document_relevance_analyses` table and multi-deliverable verification summary columns:
+- Adds table `document_relevance_analyses` with foreign keys to `projects` and `submissions`, unique constraint `uq_document_relevance_submission_file_type`, and indices on `project_id` and `submission_id`.
+- Adds columns to `project_ai_summaries` via `ALTER TABLE project_ai_summaries ADD COLUMN IF NOT EXISTS`:
+  - `document_results` (JSONB)
+  - `submission_verification_status` (VARCHAR(50))
+  - `relevant_documents_count` (INTEGER DEFAULT 0 NOT NULL)
+  - `partially_relevant_documents_count` (INTEGER DEFAULT 0 NOT NULL)
+  - `unrelated_documents_count` (INTEGER DEFAULT 0 NOT NULL)
+  - `insufficient_content_documents_count` (INTEGER DEFAULT 0 NOT NULL)
+
+Apply with psql:
+```powershell
+psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f .\migrations\0005_document_relevance_analyses.sql
+```
+
+### `0006_submission_original_filenames.sql`
+Adds columns to preserve user-uploaded original filenames for submissions:
+- `report_original_name` (VARCHAR(500))
+- `presentation_original_name` (VARCHAR(500))
+- `srs_original_name` (VARCHAR(500))
+
+Apply with psql:
+```powershell
+psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -f .\migrations\0006_submission_original_filenames.sql
+```
+
+### `cleanup_dummy_submissions.sql`
+Idempotent, transactional cleanup script that removes legacy dummy submission records (e.g., submissions 1 and 2 for Project 1) and test student accounts without touching genuine student submissions, reviews, or project milestones. Validates integrity constraints before and after execution.
+
 ## Recovery
 
 If the migration fails, stop and verify that PostgreSQL rolled back the
@@ -70,3 +120,4 @@ separate recovery database first, assess the target and data impact, then use a
 reviewed forward migration or a separately approved restoration of the target.
 Any target restore, cleanup, or data change requires its own explicit
 authorization.
+

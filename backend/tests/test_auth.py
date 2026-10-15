@@ -631,4 +631,102 @@ def test_unverified_faculty_remains_blocked_from_login(auth_db, monkeypatch):
     assert "Verify your email address before signing in." in exc_info.value.detail
 
 
+def test_login_otp_email_failure_marks_challenge_failed_and_permits_retry(auth_db, monkeypatch, caplog):
+    account = AuthAccount(
+        role="faculty",
+        email="faculty.retry@university.edu",
+        faculty_name="Retry Faculty",
+        faculty_id="FAC-RETRY-01",
+        email_verified=True,
+        faculty_approved=True,
+        password_hash=PasswordHasher().hash("correct-faculty-password"),
+    )
+    auth_db.add(account)
+    auth_db.commit()
+
+    # Step 1: Simulate email delivery failure (e.g., SMTP timeout or auth failure)
+    def failing_send(email, code):
+        raise EmailServiceError("SMTP connection timed out or failed to connect.")
+
+    monkeypatch.setattr("app.auth.service.send_otp_email", failing_send)
+
+    with pytest.raises(AuthServiceError) as exc_info:
+        begin_login(account.email, "correct-faculty-password", auth_db)
+
+    assert exc_info.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert "Unable to send the verification email. Please try again later." in exc_info.value.detail
+
+    # Verify DB state: Challenge must be marked 'failed' and consumed_at set (not pending or delivered)
+    failed_challenge = auth_db.query(AuthOTPChallenge).filter_by(
+        account_id=account.id, purpose="login"
+    ).one()
+    assert failed_challenge.delivery_status == "failed"
+    assert failed_challenge.consumed_at is not None
+
+    # Step 2: Email service recovers, retry login immediately (must NOT be blocked by cooldown or hourly quota)
+    delivered_codes = []
+    def working_send(email, code):
+        delivered_codes.append(code)
+
+    monkeypatch.setattr("app.auth.service.send_otp_email", working_send)
+
+    begin_login(account.email, "correct-faculty-password", auth_db)
+    assert len(delivered_codes) == 1
+    new_code = delivered_codes[0]
+
+    # Verify DB state: new challenge is 'delivered'
+    delivered_challenge = auth_db.query(AuthOTPChallenge).filter_by(
+        account_id=account.id, purpose="login", delivery_status="delivered"
+    ).one()
+    assert delivered_challenge.consumed_at is None
+
+    # Step 3: Successfully verify the delivered OTP code
+    result = verify_otp(account.email, new_code, "login", auth_db)
+    assert result["access_token"] is not None
+    assert result["account"]["email"] == account.email
+
+    # Step 4: Ensure secrets (password, code, HMAC keys) were never logged
+    assert "correct-faculty-password" not in caplog.text
+    assert new_code not in caplog.text
+
+
+def test_resend_otp_after_email_failure_succeeds_when_smtp_recovers(auth_db, monkeypatch, caplog):
+    account = AuthAccount(
+        role="faculty",
+        email="resend.faculty@university.edu",
+        faculty_name="Resend Faculty",
+        faculty_id="FAC-RESEND-01",
+        email_verified=False,
+        faculty_approved=False,
+        password_hash=PasswordHasher().hash("correct-faculty-password"),
+    )
+    auth_db.add(account)
+    auth_db.commit()
+
+    # Step 1: Initial registration OTP fails to send
+    def failing_send(email, code):
+        raise EmailServiceError("Unable to send the verification email.")
+
+    monkeypatch.setattr("app.auth.service.send_otp_email", failing_send)
+    with pytest.raises(AuthServiceError) as exc_info:
+        resend_otp(account.email, "registration", auth_db)
+    assert exc_info.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+    # Step 2: Resend when SMTP recovers
+    sent_codes = []
+    monkeypatch.setattr(
+        "app.auth.service.send_otp_email",
+        lambda email, code: sent_codes.append(code),
+    )
+    resend_otp(account.email, "registration", auth_db)
+    assert len(sent_codes) == 1
+
+    # Step 3: Verify the newly sent code works for registration verification
+    verify_res = verify_otp(account.email, sent_codes[0], "registration", auth_db)
+    assert verify_res["email_verified"] is True
+    assert "correct-faculty-password" not in caplog.text
+    assert sent_codes[0] not in caplog.text
+
+
+
 

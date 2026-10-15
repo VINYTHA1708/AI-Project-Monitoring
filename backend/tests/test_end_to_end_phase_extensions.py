@@ -408,6 +408,111 @@ def test_generate_ai_summary_unconfigured_provider(test_db, monkeypatch):
     assert "not configured" in exc_info.value.detail.lower()
 
 
+def test_generate_ai_summary_persists_relevance_fields(test_db, monkeypatch):
+    """Verify that all relevance fields from migration 0004 are saved and retrieved correctly."""
+    session, _faculty, _student, project, _submission = test_db
+
+    mock_summary = {
+        "summary": "Project-topic mismatch detected: document discusses sensor compression.",
+        "key_points": [],
+        "risks": ["Topic mismatch: uploaded file is unrelated to the assigned project."],
+        "recommended_next_steps": ["Upload the correct project presentation."],
+        "review_questions": ["Why does the submission discuss sensor compression?"],
+        "evidence_sources": [],
+        "advisory_disclaimer": "Advisory only.",
+        "provider": "mock-llm",
+        "model_name": "mock-v1",
+        # Relevance fields (migration 0004)
+        "document_relevance": "NOT_RELEVANT",
+        "detected_document_topic": "Sensor Data Compression Using Lossless Algorithms",
+        "assigned_project_topic": "AI-Based Student Project Monitoring",
+        "relevance_explanation": "Document covers data compression; project is about AI monitoring.",
+        "supporting_evidence": ["[Slide 1] Abstract discusses LZ77 compression"],
+        "relevant_findings": [],
+        "missing_evidence": ["Project architecture", "AI model design"],
+        "progress_assessment": "Cannot be treated as valid project evidence.",
+        "confidence": 0.95,
+    }
+
+    class MockRelevanceProvider:
+        def is_configured(self): return True
+        def get_provider_name(self): return "mock-llm"
+        def get_model_name(self): return "mock-v1"
+        def generate_summary(self, evidence): return mock_summary
+
+    monkeypatch.setattr("app.api_ai_summary.get_llm_provider", lambda: MockRelevanceProvider())
+
+    response = generate_ai_summary(project_id=project.id, db=session)
+
+    # Core fields
+    assert "mismatch" in response.summary_text.lower()
+    assert response.provider == "mock-llm"
+
+    # Relevance fields from migration 0004
+    assert response.document_relevance == "NOT_RELEVANT"
+    assert response.detected_document_topic == "Sensor Data Compression Using Lossless Algorithms"
+    assert response.assigned_project_topic == "AI-Based Student Project Monitoring"
+    assert "compression" in response.relevance_explanation.lower()
+    assert len(response.supporting_evidence) == 1
+    assert response.relevant_findings == []
+    assert len(response.missing_evidence) == 2
+    assert "valid project evidence" in response.progress_assessment
+    assert abs(response.confidence - 0.95) < 0.001
+
+    # Verify retrieval from DB survives a re-query
+    status_resp = get_ai_summary(project_id=project.id, db=session)
+    assert status_resp.latest_summary is not None
+    assert status_resp.latest_summary.document_relevance == "NOT_RELEVANT"
+    assert status_resp.latest_summary.confidence is not None
+
+    # Verify exactly one row saved (no phantom duplicates)
+    rows = session.query(ProjectAISummary).filter_by(project_id=project.id).all()
+    assert len(rows) == 1
+
+
+def test_generate_ai_summary_db_error_triggers_rollback_and_500(test_db, monkeypatch):
+    """A database error during persist must: rollback the session, return HTTP 500, and not leave a partial row."""
+    session, _faculty, _student, project, _submission = test_db
+
+    mock_summary = {
+        "summary": "Summary that will fail to save.",
+        "key_points": [], "risks": [], "recommended_next_steps": [],
+        "review_questions": [], "evidence_sources": [],
+        "provider": "mock-llm", "model_name": "mock-v1",
+        "document_relevance": "RELEVANT",
+    }
+
+    class MockProvider:
+        def is_configured(self): return True
+        def get_provider_name(self): return "mock-llm"
+        def get_model_name(self): return "mock-v1"
+        def generate_summary(self, evidence): return mock_summary
+
+    monkeypatch.setattr("app.api_ai_summary.get_llm_provider", lambda: MockProvider())
+
+    # Patch db.commit to simulate a database error at persist time
+    original_commit = session.commit
+
+    def failing_commit():
+        raise RuntimeError("Simulated DB write failure")
+
+    monkeypatch.setattr(session, "commit", failing_commit)
+
+    with pytest.raises(HTTPException) as exc_info:
+        generate_ai_summary(project_id=project.id, db=session)
+
+    assert exc_info.value.status_code == 500
+    assert "persist" in exc_info.value.detail.lower()
+
+    # Restore commit so we can query the DB
+    monkeypatch.setattr(session, "commit", original_commit)
+    session.rollback()
+
+    # No partial row should remain
+    rows = session.query(ProjectAISummary).filter_by(project_id=project.id).all()
+    assert len(rows) == 0
+
+
 # ==========================================
 # Phase 2: Faculty Approval CLI Logic Tests
 # ==========================================
@@ -489,8 +594,18 @@ def test_groq_provider_sends_user_agent_and_normalizes_response(monkeypatch):
     captured_request = {}
 
     mock_llm_json = {
+        "document_relevance": "RELEVANT",
+        "detected_document_topic": "Acoustic Fingerprinting",
+        "title_match_explanation": "Title matches the assigned project.",
+        "content_match_explanation": "Content aligns with acoustic fingerprinting.",
+        "supporting_evidence": ["Milestone 1 reached"],
+        "conflicting_evidence": [],
+        "missing_evidence": [],
+        "recommended_action": "Complete integration testing",
+        "confidence": 0.95,
         "summary": "Project progress is satisfactory.",
         "key_points": ["Milestone 1 reached"],
+        "relevant_findings": ["Milestone 1 reached"],
         "risks": ["Deployment pending"],
         "recommended_next_steps": ["Complete integration testing"],
         "review_questions": ["What is the test plan?"],
@@ -506,7 +621,7 @@ def test_groq_provider_sends_user_agent_and_normalizes_response(monkeypatch):
     class MockHTTPResponse:
         def __init__(self):
             pass
-        def read(self):
+        def read(self, *args):
             return mock_response_body
         def __enter__(self):
             return self
@@ -518,9 +633,25 @@ def test_groq_provider_sends_user_agent_and_normalizes_response(monkeypatch):
         captured_request["url"] = req.full_url
         return MockHTTPResponse()
 
-    monkeypatch.setattr("app.services.llm_summary_service.urlopen", fake_urlopen)
+    monkeypatch.setattr("app.services.groq_service.urlopen", fake_urlopen)
 
-    result = provider.generate_summary({"project_id": 1, "evidence": "sample"})
+    payload = {
+        "project_id": 1,
+        "title": "Acoustic Fingerprinting",
+        "description": "ML acoustic system",
+        "uploaded_documents": [
+            {
+                "submission_id": 1,
+                "document_type": "report",
+                "file_name": "report.pdf",
+                "document_title": "Acoustic Fingerprinting Report",
+                "extracted_text": "This report details acoustic fingerprinting using machine learning algorithms and spectral analysis.",
+                "word_count": 25,
+                "status": "success",
+            }
+        ],
+    }
+    result = provider.generate_summary(payload)
 
     # Verify User-Agent header was attached to avoid Cloudflare 1010
     assert "User-agent" in captured_request["headers"] or "User-Agent" in captured_request["headers"]
@@ -540,20 +671,36 @@ def test_groq_provider_handles_rate_limits_and_http_errors(monkeypatch):
     monkeypatch.setattr(settings, "GROQ_API_KEY", "gsk_validtestkey")
     monkeypatch.setattr(settings, "GROQ_MODEL", "llama-3.3-70b-versatile")
 
+    payload = {
+        "project_id": 1,
+        "title": "Acoustic Fingerprinting",
+        "uploaded_documents": [
+            {
+                "submission_id": 1,
+                "document_type": "report",
+                "file_name": "report.pdf",
+                "document_title": "Acoustic Fingerprinting Report",
+                "extracted_text": "This report details acoustic fingerprinting using machine learning algorithms and spectral analysis.",
+                "word_count": 25,
+                "status": "success",
+            }
+        ],
+    }
+
     def fake_urlopen_429(req, timeout=None):
         raise HTTPError(req.full_url, 429, "Too Many Requests", {}, BytesIO(b"{}"))
 
-    monkeypatch.setattr("app.services.llm_summary_service.urlopen", fake_urlopen_429)
+    monkeypatch.setattr("app.services.groq_service.urlopen", fake_urlopen_429)
     with pytest.raises(LLMServiceError) as exc429:
-        provider.generate_summary({"project_id": 1})
+        provider.generate_summary(payload)
     assert "rate limit exceeded" in str(exc429.value)
 
     def fake_urlopen_500(req, timeout=None):
         raise HTTPError(req.full_url, 500, "Internal Server Error", {}, BytesIO(b"{}"))
 
-    monkeypatch.setattr("app.services.llm_summary_service.urlopen", fake_urlopen_500)
+    monkeypatch.setattr("app.services.groq_service.urlopen", fake_urlopen_500)
     with pytest.raises(LLMServiceError) as exc500:
-        provider.generate_summary({"project_id": 1})
+        provider.generate_summary(payload)
     assert "500" in str(exc500.value)
 
 

@@ -119,7 +119,7 @@ function Completeness({ value }) {
   );
 }
 
-function DocumentCard({ document, onAnalyze, isFaculty, analyzing, projectId }) {
+function DocumentCard({ document, onAnalyze, isFaculty, analyzing, projectId, onPreview, onDownload }) {
   const status = document.status || document.analysis_status || "not_analyzed";
   return (
     <article className="document-card">
@@ -180,6 +180,34 @@ function DocumentCard({ document, onAnalyze, isFaculty, analyzing, projectId }) 
         <strong>Heuristic Check:</strong> Rule-based section detection is advisory and does not replace supervisory academic grading.
       </div>
       <div style={{ marginTop: 14, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+        {onPreview && (
+          <button
+            type="button"
+            className="btn btn-outline btn-sm"
+            onClick={() => onPreview({
+              submission_id: document.submission_id,
+              document_id: document.document_type,
+              file_type: document.document_type,
+              original_filename: document.original_filename || (document.document_type === "srs" ? "srs.pdf" : "report.pdf"),
+            })}
+          >
+            <Icon name="eye" size={13} /> View File
+          </button>
+        )}
+        {onDownload && (
+          <button
+            type="button"
+            className="btn btn-outline btn-sm"
+            onClick={() => onDownload({
+              submission_id: document.submission_id,
+              document_id: document.document_type,
+              file_type: document.document_type,
+              original_filename: document.original_filename || (document.document_type === "srs" ? "srs.pdf" : "report.pdf"),
+            })}
+          >
+            <Icon name="download" size={13} /> Download File
+          </button>
+        )}
         {isFaculty && (
           <button
             type="button" className="btn btn-outline btn-sm"
@@ -406,6 +434,18 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
 
+  // Submitted documents and preview modal state
+  const [projectDocuments, setProjectDocuments] = useState([]);
+  const [submissionDocFilter, setSubmissionDocFilter] = useState("all");
+  const [downloadingDocKey, setDownloadingDocKey] = useState(null);
+  const [previewModal, setPreviewModal] = useState({
+    isOpen: false,
+    document: null,
+    blobUrl: null,
+    loading: false,
+    error: null,
+  });
+
   const isFaculty = account?.role === "faculty";
   const isStudent = account?.role === "student";
   const navItems = isFaculty ? FACULTY_NAV : STUDENT_NAV;
@@ -436,6 +476,16 @@ function App() {
     setGitAnalysis(null);
     setAiSummaryData(null);
     setProjectId("");
+    setProjectDocuments([]);
+    setSubmissionDocFilter("all");
+    setDownloadingDocKey(null);
+    setPreviewModal({
+      isOpen: false,
+      document: null,
+      blobUrl: null,
+      loading: false,
+      error: null,
+    });
   }, []);
 
   useEffect(() => {
@@ -475,18 +525,20 @@ function App() {
     setError("");
     setAnalysisDetailWarning("");
     try {
-      const [progressData, milestonesData, membersData, gitData, aiData] = await Promise.all([
+      const [progressData, milestonesData, membersData, gitData, aiData, docsData] = await Promise.all([
         api.getProjectProgress(id, signal).catch((err) => { if (err.name === "AbortError") throw err; return null; }),
         api.getMilestones(id, signal).catch(() => []),
         api.getMembers(id, signal).catch(() => []),
         api.getGitHubAnalysis(id, signal).catch(() => null),
         api.getAISummary(id, signal).catch(() => null),
+        api.getProjectDocuments(id, null, signal).catch(() => []),
       ]);
 
       setMilestones(Array.isArray(milestonesData) ? milestonesData : []);
       setMembers(Array.isArray(membersData) ? membersData : []);
       setGitAnalysis(gitData);
       setAiSummaryData(aiData);
+      setProjectDocuments(Array.isArray(docsData) ? docsData : []);
 
       if (progressData) {
         const submissions = progressData.submissions?.details || [];
@@ -756,6 +808,94 @@ function App() {
     finally { setUploading(false); }
   }
 
+  const filteredDocuments = useMemo(() => {
+    if (submissionDocFilter === "all") {
+      return projectDocuments;
+    }
+    return projectDocuments.filter(
+      (doc) => String(doc.submission_id) === String(submissionDocFilter)
+    );
+  }, [projectDocuments, submissionDocFilter]);
+
+  async function handleDownloadDocument(doc) {
+    if (!projectId || !doc) return;
+    const subId = doc.submission_id;
+    const docId = doc.document_id || doc.file_type;
+    if (!subId || !docId) return;
+
+    const docKey = `${subId}-${docId}`;
+    try {
+      setDownloadingDocKey(docKey);
+      await api.downloadSubmissionDocument(projectId, subId, docId);
+    } catch (err) {
+      setError(err.message || "Failed to download document.");
+    } finally {
+      setDownloadingDocKey(null);
+    }
+  }
+
+  async function handlePreviewDocument(doc) {
+    if (!projectId || !doc) return;
+    const subId = doc.submission_id;
+    const docId = doc.document_id || doc.file_type;
+    if (!subId || !docId) return;
+
+    if (previewModal.blobUrl) {
+      window.URL.revokeObjectURL(previewModal.blobUrl);
+    }
+
+    const isPdf = String(doc.file_type || doc.original_filename || "").toLowerCase().includes("pdf");
+
+    if (!isPdf) {
+      setPreviewModal({
+        isOpen: true,
+        document: doc,
+        blobUrl: null,
+        loading: false,
+        error: "Preview unavailable for this file type. Download to open the original document.",
+      });
+      return;
+    }
+
+    setPreviewModal({
+      isOpen: true,
+      document: doc,
+      blobUrl: null,
+      loading: true,
+      error: null,
+    });
+
+    try {
+      const { blob } = await api.getSubmissionDocumentBlob(projectId, subId, docId, { disposition: "inline" });
+      const blobUrl = window.URL.createObjectURL(blob);
+      setPreviewModal((prev) => ({
+        ...prev,
+        blobUrl,
+        loading: false,
+        error: null,
+      }));
+    } catch (err) {
+      setPreviewModal((prev) => ({
+        ...prev,
+        loading: false,
+        error: err.message || "Preview unavailable for this file type. Download to open the original document.",
+      }));
+    }
+  }
+
+  function closePreviewModal() {
+    if (previewModal.blobUrl) {
+      window.URL.revokeObjectURL(previewModal.blobUrl);
+    }
+    setPreviewModal({
+      isOpen: false,
+      document: null,
+      blobUrl: null,
+      loading: false,
+      error: null,
+    });
+  }
+
   if (!account) return <AuthScreen onAuthenticated={setAccount} />;
 
   const signOut = clearAuthentication;
@@ -854,7 +994,7 @@ function App() {
                 <span>{isFaculty ? "Supervising project" : "Selected project"}</span>
                 <select
                   value={projectId}
-                  onChange={(e) => { setProgress(null); setProjectId(e.target.value); }}
+                  onChange={(e) => { setProgress(null); setAiSummaryData(null); setProjectDocuments([]); setSubmissionDocFilter("all"); setProjectId(e.target.value); }}
                   disabled={projectsLoading || projects.length === 0}
                   aria-label="Select a project"
                 >
@@ -1192,7 +1332,7 @@ function App() {
                       )}
                       <button
                         className={`project-select-button ${selected ? "selected" : ""}`}
-                        onClick={() => { setProgress(null); setProjectId(String(project.id)); }}
+                        onClick={() => { setProgress(null); setProjectDocuments([]); setSubmissionDocFilter("all"); setProjectId(String(project.id)); }}
                         disabled={selected}
                       >
                         {selected ? "Currently selected" : "Select this project"}
@@ -1416,6 +1556,8 @@ function App() {
                           isFaculty={true}
                           analyzing={analyzingDoc === `${document.submission_id}-${document.document_type}`}
                           projectId={projectId}
+                          onPreview={handlePreviewDocument}
+                          onDownload={handleDownloadDocument}
                         />
                       ))}
                     </div>
@@ -1734,6 +1876,152 @@ function App() {
                   </table>
                 </div>
               )}
+
+              {/* ════════════════════════════════════════════════════════════════════
+                  SUBMITTED DOCUMENTS REPOSITORY (Faculty & Student)
+              ════════════════════════════════════════════════════════════════════ */}
+              <div className="section-heading" style={{ marginTop: 36 }}>
+                <div>
+                  <div className="eyebrow">{isFaculty ? "ORIGINAL STUDENT UPLOADS" : "MY SUBMITTED FILES"}</div>
+                  <h2>Submitted Documents</h2>
+                  <p>
+                    {isFaculty
+                      ? "Direct access to original files uploaded by students for this project. Inspect or download the actual file contents."
+                      : "Access and verify the original files submitted for your project."}
+                  </p>
+                </div>
+                {details.length > 0 && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <label htmlFor="submission-filter-select" style={{ fontSize: 12, fontWeight: 600, color: "#475569" }}>
+                      Filter Submission:
+                    </label>
+                    <select
+                      id="submission-filter-select"
+                      className="form-control"
+                      style={{ padding: "6px 12px", fontSize: 12, borderRadius: 6, border: "1px solid #cbd5e1" }}
+                      value={submissionDocFilter}
+                      onChange={(e) => setSubmissionDocFilter(e.target.value)}
+                    >
+                      <option value="all">All Submissions ({projectDocuments.length} files)</option>
+                      {details.map((sub) => (
+                        <option key={sub.submission_id} value={sub.submission_id}>
+                          Submission #{sub.submission_id} (Week {sub.week_number})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              {filteredDocuments.length === 0 ? (
+                <div className="table-empty" data-testid="submitted-docs-empty">
+                  <span className="empty-icon"><Icon name="file" size={20} /></span>
+                  <strong>No submitted files available</strong>
+                  <p>
+                    {submissionDocFilter !== "all"
+                      ? `No uploaded files attached to Submission #${submissionDocFilter}.`
+                      : "No submissions have been uploaded for this project yet."}
+                  </p>
+                </div>
+              ) : (
+                <div className="table-shell" data-testid="submitted-docs-table">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Original File</th>
+                        <th>Type</th>
+                        <th>Submission</th>
+                        <th>Team / Submitter</th>
+                        <th>File Size</th>
+                        <th>Analysis Status</th>
+                        <th style={{ textAlign: "right" }}>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredDocuments.map((doc) => {
+                        const fileExt = (doc.original_filename || doc.file_type || "").split(".").pop().toLowerCase();
+                        const pillClass = `file-pill file-pill-${fileExt || doc.file_type || "other"}`;
+                        const docKey = `${doc.submission_id}-${doc.document_id || doc.file_type}`;
+                        const isDownloading = downloadingDocKey === docKey;
+                        const teamDisplay = doc.student_name || (doc.team_members?.length ? doc.team_members.join(", ") : members?.map(m => m.name).join(", ") || "Project Team");
+                        // file_exists=false means DB has a path but the actual file is missing on disk
+                        const fileOnDisk = doc.file_exists !== false;
+
+                        return (
+                          <tr key={docKey} data-testid={`doc-row-${docKey}`}>
+                            <td>
+                              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                                <span style={{ color: fileOnDisk ? "#475569" : "#dc2626" }}><Icon name="file" size={18} /></span>
+                                <div>
+                                  <strong style={{ fontSize: 13, color: fileOnDisk ? "#0f172a" : "#dc2626", wordBreak: "break-all", display: "block" }}>
+                                    {doc.original_filename}
+                                  </strong>
+                                  {!fileOnDisk && (
+                                    <small style={{ color: "#dc2626", fontWeight: 600 }} data-testid={`missing-file-${docKey}`}>
+                                      ⚠ File not found on server
+                                    </small>
+                                  )}
+                                  {fileOnDisk && <small style={{ color: "#64748b" }}>Doc ID: {doc.document_id || doc.file_type}</small>}
+                                </div>
+                              </div>
+                            </td>
+                            <td>
+                              <span className={pillClass}>
+                                {(doc.file_type || fileExt || "file").toUpperCase()}
+                              </span>
+                            </td>
+                            <td>
+                              <span className="submission-id">SUB-{String(doc.submission_id).padStart(3, "0")}</span>
+                              <div style={{ fontSize: 11, color: "#64748b" }}>
+                                Week {doc.week_number} · {doc.submitted_at ? new Date(doc.submitted_at).toLocaleDateString() : "—"}
+                              </div>
+                            </td>
+                            <td>
+                              <span style={{ fontSize: 12, color: "#334155" }}>{teamDisplay}</span>
+                            </td>
+                            <td>
+                              <span style={{ fontSize: 12, fontFamily: "monospace", color: "#475569" }}>
+                                {!fileOnDisk ? "—" : (doc.size_formatted || (doc.file_size ? `${(doc.file_size / 1024).toFixed(1)} KB` : "—"))}
+                              </span>
+                            </td>
+                            <td>
+                              <StatusBadge status={doc.analysis_status || "not_analyzed"} />
+                            </td>
+                            <td style={{ textAlign: "right" }}>
+                              {!fileOnDisk ? (
+                                <span style={{ fontSize: 11, color: "#dc2626", fontStyle: "italic" }} data-testid={`unavailable-${docKey}`}>
+                                  File unavailable
+                                </span>
+                              ) : (
+                                <div className="doc-action-group" style={{ justifyContent: "flex-end" }}>
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline btn-sm"
+                                    onClick={() => handlePreviewDocument(doc)}
+                                    title="Preview or view document"
+                                  >
+                                    <Icon name="eye" size={13} /> View
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-primary btn-sm"
+                                    onClick={() => handleDownloadDocument(doc)}
+                                    disabled={isDownloading}
+                                    title="Download original document bytes"
+                                  >
+                                    <Icon name="download" size={13} />
+                                    {isDownloading ? "Downloading…" : "Download"}
+                                  </button>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </section>
           )}
 
@@ -1890,6 +2178,8 @@ function App() {
                       isFaculty={isFaculty}
                       analyzing={analyzingDoc === `${document.submission_id}-${document.document_type}`}
                       projectId={projectId}
+                      onPreview={handlePreviewDocument}
+                      onDownload={handleDownloadDocument}
                     />
                   ))}
                 </div>
@@ -2031,30 +2321,356 @@ function App() {
                     <span className="badge badge-complete">Advisory Synthesis</span>
                   </div>
 
+                  {/* Submission Verification Status Bar & Metrics */}
+                  {aiSummaryData.latest_summary.submission_verification_status && (
+                    <div className="submission-status-bar" data-testid="submission-status-bar">
+                      <div className="submission-status-info">
+                        <span>Submission Verification Status:</span>
+                        <span
+                          className={`submission-status-badge ${
+                            aiSummaryData.latest_summary.submission_verification_status === "VERIFIED_RELEVANT"
+                              ? "status-badge-verified"
+                              : aiSummaryData.latest_summary.submission_verification_status === "CONTRADICTORY_TOPICS" ||
+                                aiSummaryData.latest_summary.submission_verification_status === "MIXED_RELEVANCE"
+                              ? "status-badge-mixed"
+                              : aiSummaryData.latest_summary.submission_verification_status === "UNVERIFIED_IRRELEVANT"
+                              ? "status-badge-unverified"
+                              : "status-badge-insufficient"
+                          }`}
+                        >
+                          {aiSummaryData.latest_summary.submission_verification_status.replaceAll("_", " ")}
+                        </span>
+                      </div>
+                      <div className="submission-metrics-row">
+                        {(aiSummaryData.latest_summary.relevant_documents_count ?? 0) > 0 && (
+                          <span className="metric-pill metric-pill-relevant">
+                            {"\u2713"} {aiSummaryData.latest_summary.relevant_documents_count} Relevant
+                          </span>
+                        )}
+                        {(aiSummaryData.latest_summary.partially_relevant_documents_count ?? 0) > 0 && (
+                          <span className="metric-pill metric-pill-partial">
+                            {"\u26A0"} {aiSummaryData.latest_summary.partially_relevant_documents_count} Partially Relevant
+                          </span>
+                        )}
+                        {(aiSummaryData.latest_summary.unrelated_documents_count ?? 0) > 0 && (
+                          <span className="metric-pill metric-pill-unrelated">
+                            {"\u2715"} {aiSummaryData.latest_summary.unrelated_documents_count} Unrelated
+                          </span>
+                        )}
+                        {(aiSummaryData.latest_summary.insufficient_content_documents_count ?? 0) > 0 && (
+                          <span className="metric-pill metric-pill-insufficient">
+                            {"\u2139"} {aiSummaryData.latest_summary.insufficient_content_documents_count} Insufficient Content
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Mixed Deliverable Alert Banner */}
+                  {(aiSummaryData.latest_summary.submission_verification_status === "CONTRADICTORY_TOPICS" ||
+                    ((aiSummaryData.latest_summary.unrelated_documents_count ?? 0) > 0 &&
+                     (aiSummaryData.latest_summary.relevant_documents_count ?? 0) > 0)) && (
+                    <div className="mixed-deliverable-alert" data-testid="mixed-deliverable-alert">
+                      <Icon name="alert" size={20} />
+                      <div>
+                        <strong>Mixed Deliverable Alert: Contradictory Submission Topics</strong>
+                        <span>
+                          One or more uploaded deliverables in this submission discuss a different topic from the assigned project. Progress is credited solely from verified relevant deliverables; unrelated deliverables have been quarantined from the project evaluation.
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {aiSummaryData.latest_summary.document_relevance && (
+                    <div
+                      className={`relevance-callout ${
+                        aiSummaryData.latest_summary.document_relevance === "NOT_RELEVANT"
+                          ? "relevance-callout-mismatch"
+                          : aiSummaryData.latest_summary.document_relevance === "PARTIALLY_RELEVANT"
+                          ? "relevance-callout-partial"
+                          : aiSummaryData.latest_summary.document_relevance === "RELEVANT"
+                          ? "relevance-callout-relevant"
+                          : "relevance-callout-insufficient"
+                      }`}
+                      data-testid="relevance-banner"
+                    >
+                      <div className="relevance-header">
+                        <div className="relevance-title">
+                          <Icon
+                            name={
+                              aiSummaryData.latest_summary.document_relevance === "NOT_RELEVANT"
+                                ? "alert"
+                                : aiSummaryData.latest_summary.document_relevance === "RELEVANT"
+                                ? "check"
+                                : "alert"
+                            }
+                            size={18}
+                          />
+                          <span>
+                            {aiSummaryData.latest_summary.document_relevance === "NOT_RELEVANT"
+                              ? "Project-topic mismatch detected. This document appears to discuss a different topic and should not be treated as evidence of progress on the assigned project."
+                              : aiSummaryData.latest_summary.document_relevance === "PARTIALLY_RELEVANT"
+                              ? "Partial project-topic match detected. Some content relates to the assigned project, but significant sections appear unrelated."
+                              : aiSummaryData.latest_summary.document_relevance === "RELEVANT"
+                              ? "Document verified as relevant to the assigned project."
+                              : "Insufficient document content for reliable relevance determination."}
+                          </span>
+                        </div>
+                        <span
+                          className={`relevance-badge ${
+                            aiSummaryData.latest_summary.document_relevance === "NOT_RELEVANT"
+                              ? "relevance-badge-mismatch"
+                              : aiSummaryData.latest_summary.document_relevance === "PARTIALLY_RELEVANT"
+                              ? "relevance-badge-partial"
+                              : aiSummaryData.latest_summary.document_relevance === "RELEVANT"
+                              ? "relevance-badge-relevant"
+                              : "relevance-badge-insufficient"
+                          }`}
+                        >
+                          {aiSummaryData.latest_summary.document_relevance.replaceAll("_", " ")}
+                        </span>
+                      </div>
+
+                      {aiSummaryData.latest_summary.relevance_explanation && (
+                        <p className="relevance-explanation">
+                          {aiSummaryData.latest_summary.relevance_explanation}
+                        </p>
+                      )}
+
+                      <div className="relevance-comparison-grid">
+                        <div className="relevance-comparison-col">
+                          <strong>Assigned Project Topic</strong>
+                          <span>
+                            {aiSummaryData.latest_summary.assigned_project_topic ||
+                              selectedProject?.title ||
+                              "Assigned Project"}
+                          </span>
+                        </div>
+                        <div className="relevance-comparison-col">
+                          <strong>Detected Document Topic</strong>
+                          <span>
+                            {aiSummaryData.latest_summary.detected_document_topic ||
+                              "Not clearly identifiable from document text"}
+                          </span>
+                        </div>
+                      </div>
+
+                      {aiSummaryData.latest_summary.confidence !== null &&
+                        aiSummaryData.latest_summary.confidence !== undefined && (
+                          <div style={{ fontSize: 11, opacity: 0.85, marginTop: 4 }}>
+                            Relevance confidence estimate:{" "}
+                            <strong>
+                              {Math.round(aiSummaryData.latest_summary.confidence * 100)}%
+                            </strong>{" "}
+                            (Advisory heuristic)
+                          </div>
+                        )}
+                    </div>
+                  )}
+
+                  {/* ── Document-by-Document Verification Cards ── */}
+                  {aiSummaryData.latest_summary.document_results?.length > 0 && (
+                    <div className="doc-verification-section" data-testid="document-verification-section">
+                      <div className="doc-verification-section-title">
+                        <Icon name="file" size={17} />
+                        <span>Independent Deliverable Verification ({aiSummaryData.latest_summary.document_results.length} Document{aiSummaryData.latest_summary.document_results.length > 1 ? "s" : ""})</span>
+                      </div>
+                      <div className="doc-cards-grid">
+                        {aiSummaryData.latest_summary.document_results.map((doc, idx) => {
+                          const relClass = doc.relevance === "RELEVANT"
+                            ? "doc-card-relevant"
+                            : doc.relevance === "PARTIALLY_RELEVANT"
+                            ? "doc-card-partial"
+                            : doc.relevance === "NOT_RELEVANT"
+                            ? "doc-card-unrelated"
+                            : "doc-card-insufficient";
+                          const badgeClass = doc.relevance === "RELEVANT"
+                            ? "relevance-badge-relevant"
+                            : doc.relevance === "PARTIALLY_RELEVANT"
+                            ? "relevance-badge-partial"
+                            : doc.relevance === "NOT_RELEVANT"
+                            ? "relevance-badge-mismatch"
+                            : "relevance-badge-insufficient";
+                          return (
+                            <div key={idx} className={`doc-card ${relClass}`} data-testid={`doc-card-${idx}`}>
+                              <div className="doc-card-header">
+                                <div>
+                                  <span className="doc-card-filename">{doc.file_name || `${(doc.file_type || "file").toUpperCase()} Deliverable`}</span>
+                                  <span className="doc-file-type-badge">{(doc.file_type || "file").toUpperCase()}</span>
+                                </div>
+                                <span className={`relevance-badge ${badgeClass}`}>
+                                  {doc.relevance ? doc.relevance.replaceAll("_", " ") : "UNVERIFIED"}
+                                </span>
+                              </div>
+
+                              {doc.document_title && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Document Title</strong>
+                                  <span>{doc.document_title}</span>
+                                </div>
+                              )}
+
+                              {doc.detected_topic && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Detected Topic</strong>
+                                  <span>{doc.detected_topic}</span>
+                                </div>
+                              )}
+
+                              {doc.relevance_explanation && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Evaluation</strong>
+                                  <span>{doc.relevance_explanation}</span>
+                                </div>
+                              )}
+
+                              {doc.title_comparison && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Title Alignment</strong>
+                                  <span>{doc.title_comparison}</span>
+                                </div>
+                              )}
+
+                              {doc.content_comparison && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Content Alignment</strong>
+                                  <span>{doc.content_comparison}</span>
+                                </div>
+                              )}
+
+                              {doc.supporting_citations?.length > 0 && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Document Citations</strong>
+                                  <div className="doc-card-citations">
+                                    {doc.supporting_citations.map((cite, cIdx) => (
+                                      <div key={cIdx} className="doc-card-citation-item">{cite}</div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {doc.conflicting_evidence?.length > 0 && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Unrelated / Conflicting Content</strong>
+                                  <div className="doc-card-conflicting">
+                                    {doc.conflicting_evidence.join("; ")}
+                                  </div>
+                                </div>
+                              )}
+
+                              {doc.recommended_action && (
+                                <div className="doc-card-detail-item">
+                                  <strong>Recommended Action</strong>
+                                  <div className="doc-card-action">
+                                    {doc.recommended_action}
+                                  </div>
+                                </div>
+                              )}
+
+                              <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center", borderTop: "1px solid #f1f5f9", paddingTop: 10 }}>
+                                <button
+                                  type="button"
+                                  className="btn btn-outline btn-sm"
+                                  onClick={() => handlePreviewDocument({
+                                    submission_id: doc.submission_id || aiSummaryData.latest_summary.submission_id,
+                                    document_id: doc.document_id || doc.file_type,
+                                    file_type: doc.file_type,
+                                    original_filename: doc.original_filename || doc.file_name,
+                                  })}
+                                >
+                                  <Icon name="eye" size={13} /> View
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-primary btn-sm"
+                                  disabled={downloadingDocKey === `${doc.submission_id || aiSummaryData.latest_summary.submission_id}-${doc.document_id || doc.file_type}`}
+                                  onClick={() => handleDownloadDocument({
+                                    submission_id: doc.submission_id || aiSummaryData.latest_summary.submission_id,
+                                    document_id: doc.document_id || doc.file_type,
+                                    file_type: doc.file_type,
+                                    original_filename: doc.original_filename || doc.file_name,
+                                  })}
+                                >
+                                  <Icon name="download" size={13} />
+                                  {downloadingDocKey === `${doc.submission_id || aiSummaryData.latest_summary.submission_id}-${doc.document_id || doc.file_type}` ? "Downloading…" : "Download"}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   <div className="ai-summary-grid">
                     <div className="ai-card ai-card-full">
                       <div className="ai-card-title"><Icon name="grid" size={16} /> Executive Summary</div>
                       <p>{aiSummaryData.latest_summary.summary_text}</p>
                     </div>
+
+                    {aiSummaryData.latest_summary.progress_assessment && (
+                      <div className="ai-card ai-card-full" style={{ borderLeft: "4px solid #4b64eb" }}>
+                        <div className="ai-card-title"><Icon name="cpu" size={16} /> Evidence-Based Progress Assessment</div>
+                        <p>{aiSummaryData.latest_summary.progress_assessment}</p>
+                      </div>
+                    )}
+
+                    {aiSummaryData.latest_summary.supporting_evidence?.length > 0 && (
+                      <div className="ai-card ai-card-full">
+                        <div className="ai-card-title"><Icon name="file" size={16} /> Supporting Document Citations & Slide Evidence</div>
+                        <div>
+                          {aiSummaryData.latest_summary.supporting_evidence.map((quote, i) => (
+                            <div key={i} className="ai-evidence-quote">{quote}</div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     <div className="ai-card">
-                      <div className="ai-card-title"><Icon name="check" size={16} /> Key Achievements & Milestones</div>
-                      {aiSummaryData.latest_summary.key_points?.length
-                        ? <ul className="ai-list">{aiSummaryData.latest_summary.key_points.map((pt, i) => <li key={i}>{pt}</li>)}</ul>
-                        : <p>None recorded in available evidence.</p>}
+                      <div className="ai-card-title"><Icon name="check" size={16} /> Verified Findings &amp; Demonstrations</div>
+                      {(() => {
+                        const s = aiSummaryData.latest_summary;
+                        const rel = s.document_relevance;
+                        const findings = s.relevant_findings?.length
+                          ? s.relevant_findings
+                          : (!s.relevant_findings && s.key_points?.length ? s.key_points : null);
+                        if (findings) {
+                          return <ul className="ai-list">{findings.map((pt, i) => <li key={i}>{pt}</li>)}</ul>;
+                        }
+                        const emptyMsg =
+                          rel === "NOT_RELEVANT"
+                            ? "No relevant findings \u2014 the uploaded document is not related to this project."
+                            : rel === "INSUFFICIENT_CONTENT"
+                            ? "Cannot evaluate findings \u2014 the document contains insufficient readable content."
+                            : rel === "PARTIALLY_RELEVANT"
+                            ? "No clearly relevant findings could be isolated from the submitted document."
+                            : "No specific findings were extracted from the submitted evidence.";
+                        return <p style={{ fontStyle: "italic", color: "#8a96a8" }}>{emptyMsg}</p>;
+                      })()}
                     </div>
+
+                    <div className="ai-card">
+                      <div className="ai-card-title"><Icon name="alert" size={16} /> Missing Evidence & Unaddressed Requirements</div>
+                      {aiSummaryData.latest_summary.missing_evidence?.length
+                        ? <ul className="ai-list">{aiSummaryData.latest_summary.missing_evidence.map((item, i) => <li key={i} style={{ color: "#a0484a" }}>{item}</li>)}</ul>
+                        : <p>No specific missing evidence flagged.</p>}
+                    </div>
+
                     <div className="ai-card">
                       <div className="ai-card-title"><Icon name="alert" size={16} /> Identified Project Risks & Gaps</div>
                       {aiSummaryData.latest_summary.risks?.length
                         ? <ul className="ai-list">{aiSummaryData.latest_summary.risks.map((risk, i) => <li key={i} style={{ color: "#a0484a" }}>{risk}</li>)}</ul>
                         : <p>No elevated risks flagged.</p>}
                     </div>
+
                     <div className="ai-card">
                       <div className="ai-card-title"><Icon name="chevron" size={16} /> Recommended Next Steps</div>
                       {aiSummaryData.latest_summary.recommended_next_steps?.length
                         ? <ul className="ai-list">{aiSummaryData.latest_summary.recommended_next_steps.map((step, i) => <li key={i}>{step}</li>)}</ul>
                         : <p>No immediate steps pending.</p>}
                     </div>
-                    <div className="ai-card">
+
+                    <div className="ai-card ai-card-full">
                       <div className="ai-card-title"><Icon name="calendar" size={16} /> Targeted Questions for Next Review</div>
                       {aiSummaryData.latest_summary.review_questions?.length
                         ? <ul className="ai-list">{aiSummaryData.latest_summary.review_questions.map((q, i) => <li key={i}>{q}</li>)}</ul>
@@ -2151,6 +2767,72 @@ function App() {
           </footer>
         </div>
       </main>
+
+      {/* ── Document Preview Modal ── */}
+      {previewModal.isOpen && (
+        <div className="modal-backdrop" onClick={closePreviewModal} data-testid="preview-modal-backdrop">
+          <div className="preview-modal-dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+            <div className="preview-modal-header">
+              <div>
+                <h3>{previewModal.document?.original_filename || previewModal.document?.file_name || "Document Preview"}</h3>
+                <div className="preview-modal-subtitle">
+                  <span className={`file-pill file-pill-${(previewModal.document?.file_type || "").toLowerCase()}`}>
+                    {(previewModal.document?.file_type || "file").toUpperCase()}
+                  </span>
+                  <span>Submission #{previewModal.document?.submission_id}</span>
+                  {previewModal.document?.size_formatted && <span>· {previewModal.document.size_formatted}</span>}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={() => handleDownloadDocument(previewModal.document)}
+                  disabled={downloadingDocKey === `${previewModal.document?.submission_id}-${previewModal.document?.document_id || previewModal.document?.file_type}`}
+                >
+                  <Icon name="download" size={14} /> Download Original
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-outline btn-sm"
+                  onClick={closePreviewModal}
+                  aria-label="Close preview"
+                >
+                  ✕ Close
+                </button>
+              </div>
+            </div>
+
+            <div className="preview-modal-body">
+              {previewModal.loading ? (
+                <div style={{ margin: "auto", textAlign: "center", padding: 40, color: "#475569" }}>
+                  <p>Loading document preview…</p>
+                </div>
+              ) : previewModal.error ? (
+                <div className="preview-unsupported-card" data-testid="preview-unsupported-message">
+                  <Icon name="alert" size={36} />
+                  <h4>Browser Preview Unavailable</h4>
+                  <p>{previewModal.error}</p>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => handleDownloadDocument(previewModal.document)}
+                  >
+                    <Icon name="download" size={15} /> Download Original File
+                  </button>
+                </div>
+              ) : previewModal.blobUrl ? (
+                <iframe
+                  src={previewModal.blobUrl}
+                  title={previewModal.document?.original_filename || "Document Preview"}
+                  className="preview-iframe"
+                  data-testid="preview-iframe"
+                />
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

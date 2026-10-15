@@ -1,5 +1,9 @@
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
@@ -11,9 +15,11 @@ class Settings(BaseSettings):
     SMTP_USERNAME: str | None = None
     SMTP_PASSWORD: str | None = None
     SMTP_FROM_EMAIL: str | None = None
+    SMTP_TIMEOUT_SECONDS: int = Field(default=30, gt=0, le=120)
 
     GROQ_API_KEY: str | None = None
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_MAX_TOKENS: int = Field(default=3000, gt=0, le=32768)
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-1.5-flash"
     LLM_PROVIDER: str = "groq"
@@ -49,8 +55,13 @@ class Settings(BaseSettings):
     AUTH_RATE_LIMIT_RESEND_IP_MAX: int = Field(default=20, gt=0, le=10000)
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(
+            str(_BACKEND_DIR / ".env"),
+            str(_BACKEND_DIR.parent / ".env"),
+            ".env",
+        ),
         env_file_encoding="utf-8-sig",  # utf-8-sig strips the BOM that Windows tools add
+        extra="ignore",
     )
 
     @property

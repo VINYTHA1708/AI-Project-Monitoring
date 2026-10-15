@@ -174,6 +174,101 @@ export const api = {
     );
   },
 
+  // Submission Documents (Faculty & Student Access)
+  getSubmissionDocuments(projectId, submissionId, signal) {
+    return request(
+      `/projects/${encodeURIComponent(projectId)}/submissions/${encodeURIComponent(submissionId)}/documents`,
+      { signal },
+    );
+  },
+  getProjectDocuments(projectId, submissionId, signal) {
+    const query = submissionId ? `?submission_id=${encodeURIComponent(submissionId)}` : "";
+    return request(
+      `/projects/${encodeURIComponent(projectId)}/documents${query}`,
+      { signal },
+    );
+  },
+  async downloadSubmissionDocument(projectId, submissionId, documentId) {
+    const url = `${API_BASE_URL}/projects/${encodeURIComponent(projectId)}/submissions/${encodeURIComponent(submissionId)}/documents/${encodeURIComponent(documentId)}/download`;
+    const headers = {};
+    if (accessToken) {
+      headers.Authorization = `Bearer ${accessToken}`;
+    }
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const errorData = await response.json();
+        detail = errorData.detail || errorData.message || "";
+      } catch {}
+      throw new Error(detail || `Download failed (${response.status})`);
+    }
+
+    let filename = `submission_${submissionId}_${documentId}`;
+    const disposition = response.headers.get("Content-Disposition");
+    if (disposition) {
+      const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+      if (utf8Match && utf8Match[1]) {
+        try {
+          filename = decodeURIComponent(utf8Match[1]);
+        } catch {}
+      } else {
+        const match = disposition.match(/filename="?([^";]+)"?/i);
+        if (match && match[1]) {
+          filename = match[1];
+        }
+      }
+    }
+
+    const blob = await response.blob();
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = downloadUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 5000);
+    return { filename, size: blob.size };
+  },
+  async getSubmissionDocumentBlob(projectId, submissionId, documentId, { disposition = "inline" } = {}) {
+    const endpoint = disposition === "inline" ? "preview" : "download";
+    const url = `${API_BASE_URL}/projects/${encodeURIComponent(projectId)}/submissions/${encodeURIComponent(submissionId)}/documents/${encodeURIComponent(documentId)}/${endpoint}`;
+    const headers = {};
+    if (accessToken) {
+      headers.Authorization = `Bearer ${accessToken}`;
+    }
+    const response = await fetch(url, { headers });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const errorData = await response.json();
+        detail = errorData.detail || errorData.message || "";
+      } catch {}
+      throw new Error(detail || `Document preview failed (${response.status})`);
+    }
+
+    let filename = `document_${documentId}`;
+    const dispHeader = response.headers.get("Content-Disposition");
+    if (dispHeader) {
+      const utf8Match = dispHeader.match(/filename\*=UTF-8''([^;]+)/i);
+      if (utf8Match && utf8Match[1]) {
+        try {
+          filename = decodeURIComponent(utf8Match[1]);
+        } catch {}
+      } else {
+        const match = dispHeader.match(/filename="?([^";]+)"?/i);
+        if (match && match[1]) {
+          filename = match[1];
+        }
+      }
+    }
+
+    const blob = await response.blob();
+    const contentType = response.headers.get("Content-Type") || blob.type;
+    return { blob, filename, contentType };
+  },
+
   // Progress & Analysis
   getProjectProgress(projectId, signal) {
     return request(`/projects/${encodeURIComponent(projectId)}/progress`, { signal });

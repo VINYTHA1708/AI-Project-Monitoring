@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -19,23 +20,23 @@ UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
 ALLOWED_TYPES = {
-    "report": {".pdf"},
+    "report": {".pdf", ".docx"},
     "presentation": {".ppt", ".pptx"},
-    "srs": {".pdf"},
+    "srs": {".pdf", ".docx"},
 }
 
 
 def _valid_signature(extension: str, header: bytes) -> bool:
     if extension == ".pdf":
         return b"%PDF-" in header[:1024]
-    if extension == ".pptx":
+    if extension in {".pptx", ".docx"}:
         return header.startswith(b"PK\x03\x04")
     if extension == ".ppt":
         return header.startswith(bytes.fromhex("D0CF11E0A1B11AE1"))
     return False
 
 
-async def save_file(file: UploadFile, category: str) -> str:
+async def save_file(file: UploadFile, category: str) -> tuple[str, str, int]:
     original_name = Path(file.filename or "").name
     extension = Path(original_name).suffix.lower()
 
@@ -92,10 +93,40 @@ async def save_file(file: UploadFile, category: str) -> str:
                     detail="Invalid presentation file content.",
                 )
 
-        return destination.name
+        if extension == ".docx":
+            try:
+                with zipfile.ZipFile(destination) as archive:
+                    valid_doc = "word/document.xml" in archive.namelist()
+            except (OSError, zipfile.BadZipFile):
+                valid_doc = False
+            if not valid_doc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid {category} file content.",
+                )
+
+        # Write sidecar metadata JSON to disk for long-term file identity preservation
+        meta_file = destination.with_suffix(destination.suffix + ".meta.json")
+        try:
+            with meta_file.open("w", encoding="utf-8") as meta_out:
+                json.dump(
+                    {
+                        "original_filename": original_name,
+                        "category": category,
+                        "file_size": total_size,
+                        "extension": extension,
+                        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    meta_out,
+                )
+        except Exception:
+            pass
+
+        return destination.name, original_name, total_size
 
     except Exception:
         destination.unlink(missing_ok=True)
+        destination.with_suffix(destination.suffix + ".meta.json").unlink(missing_ok=True)
         raise
     finally:
         await file.close()
@@ -123,18 +154,22 @@ async def upload_submission(
 
     saved_paths = []
     try:
-        report_path = await save_file(report, "report") if report else None
+        report_path, report_orig, report_size = (
+            await save_file(report, "report") if report else (None, None, 0)
+        )
         if report_path:
             saved_paths.append(report_path)
 
-        presentation_path = (
+        presentation_path, presentation_orig, pres_size = (
             await save_file(presentation, "presentation")
-            if presentation else None
+            if presentation else (None, None, 0)
         )
         if presentation_path:
             saved_paths.append(presentation_path)
 
-        srs_path = await save_file(srs, "srs") if srs else None
+        srs_path, srs_orig, srs_size = (
+            await save_file(srs, "srs") if srs else (None, None, 0)
+        )
         if srs_path:
             saved_paths.append(srs_path)
 
@@ -142,8 +177,11 @@ async def upload_submission(
             project_id=project_id,
             week_number=week_number,
             report_path=report_path,
+            report_original_name=report_orig,
             presentation_path=presentation_path,
+            presentation_original_name=presentation_orig,
             srs_path=srs_path,
+            srs_original_name=srs_orig,
             notes=notes,
             submitted_at=datetime.now(timezone.utc),
             status="SUBMITTED",
@@ -159,8 +197,11 @@ async def upload_submission(
             "project_id": project_id,
             "week_number": week_number,
             "report_uploaded": bool(report_path),
+            "report_filename": report_orig,
             "presentation_uploaded": bool(presentation_path),
+            "presentation_filename": presentation_orig,
             "srs_uploaded": bool(srs_path),
+            "srs_filename": srs_orig,
             "status": submission.status,
         }
 
@@ -168,4 +209,5 @@ async def upload_submission(
         db.rollback()
         for path in saved_paths:
             (UPLOAD_DIR / path).unlink(missing_ok=True)
+            (UPLOAD_DIR / (path + ".meta.json")).unlink(missing_ok=True)
         raise

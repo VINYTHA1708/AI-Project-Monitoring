@@ -10,7 +10,13 @@ from app.auth.dependencies import (
     require_project_access,
     require_roles,
 )
-from app.db.models import AuthAccount, FacultyProjectAssignment, Project, ProjectMember
+from app.db.models import (
+    AuthAccount,
+    FacultyProjectAssignment,
+    Project,
+    ProjectMember,
+    Submission,
+)
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
@@ -183,3 +189,34 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
 
     db.delete(project)
     db.commit()
+
+
+@router.get(
+    "/{project_id}/documents",
+    dependencies=[Depends(require_project_access)],
+)
+def list_project_documents(
+    project_id: int,
+    submission_id: int | None = None,
+    db: Session = Depends(get_db),
+    account: Principal = Depends(require_project_access),
+):
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    from app.api_submissions import _resolve_submission_document
+
+    query = db.query(Submission).filter_by(project_id=project_id)
+    if submission_id is not None:
+        query = query.filter_by(id=submission_id)
+    submissions = query.order_by(Submission.week_number.desc(), Submission.id.desc()).all()
+
+    all_docs = []
+    for sub in submissions:
+        for cat in ("report", "presentation", "srs"):
+            doc = _resolve_submission_document(sub, cat, project, db)
+            if doc is not None:
+                all_docs.append(doc)
+
+    return all_docs

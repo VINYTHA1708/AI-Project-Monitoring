@@ -115,6 +115,7 @@ def _new_challenge(
         ).where(
             AuthOTPChallenge.account_id == account.id,
             AuthOTPChallenge.purpose == purpose,
+            AuthOTPChallenge.delivery_status.in_(("delivered", "pending")),
             AuthOTPChallenge.created_at >= cutoff,
         )
     ).one()
@@ -224,6 +225,12 @@ def _send_challenge(email: str, purpose: str, db: Session) -> None:
         send_otp_email(destination, code)
     except (EmailServiceError, OSError) as exc:
         _finalize_challenge_delivery(challenge_id, db, delivered=False)
+        logger.error(
+            "Failed to deliver OTP email for purpose=%s (account_id=%s): %s",
+            purpose,
+            account.id,
+            exc,
+        )
         raise AuthServiceError(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Unable to send the verification email. Please try again later.",
