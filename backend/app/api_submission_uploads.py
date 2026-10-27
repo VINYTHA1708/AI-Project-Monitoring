@@ -1,20 +1,25 @@
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 import zipfile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.auth.dependencies import get_db, require_project_access
-from app.db.models import Project, Submission
+from app.auth.dependencies import Principal, get_db, require_project_access
+from app.db.models import AuthAccount, FacultyProjectAssignment, Project, Student, Submission
+from app.services.n8n_notifier import notify_faculty_submission
 
 router = APIRouter(
     prefix="/projects",
     tags=["Submission Uploads"],
     dependencies=[Depends(require_project_access)],
 )
+
+logger = logging.getLogger(__name__)
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -141,7 +146,15 @@ async def upload_submission(
     srs: UploadFile | None = File(None),
     notes: str | None = Form(None),
     db: Session = Depends(get_db),
+    account: Principal = Depends(require_project_access),
 ):
+    # This endpoint is student-only: faculty review via the reviews API.
+    if account.role != "student":
+        raise HTTPException(
+            status_code=403,
+            detail="Only students may upload project submissions.",
+        )
+
     project = db.get(Project, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -191,7 +204,10 @@ async def upload_submission(
         db.commit()
         db.refresh(submission)
 
-        return {
+        # Return the HTTP response immediately; the notification is dispatched
+        # after this block so that neither a missing student record nor an
+        # absent faculty supervisor can affect the committed submission.
+        response_payload = {
             "message": "Submission uploaded and recorded successfully",
             "submission_id": submission.id,
             "project_id": project_id,
@@ -211,3 +227,59 @@ async def upload_submission(
             (UPLOAD_DIR / path).unlink(missing_ok=True)
             (UPLOAD_DIR / (path + ".meta.json")).unlink(missing_ok=True)
         raise
+
+    # ── n8n e-mail notification ───────────────────────────────────────────────
+    # Placed OUTSIDE the rollback try/except: the submission is already
+    # committed.  Any failure here must never roll back files or DB rows.
+    #
+    # Student identity ── load the Student row via account.student_id so we
+    # send the student's canonical name and email, not the auth-account email.
+    student = db.get(Student, account.student_id) if account.student_id else None
+    if student is None:
+        logger.warning(
+            "n8n notification skipped for submission %s: student record not found "
+            "(account_id=%s, student_id=%s).",
+            submission.id,
+            account.id,
+            account.student_id,
+        )
+        return response_payload
+
+    # Faculty identity ── pick the earliest-assigned approved supervisor so the
+    # result is deterministic when multiple supervisors exist.
+    faculty_account = db.execute(
+        select(AuthAccount)
+        .join(
+            FacultyProjectAssignment,
+            FacultyProjectAssignment.faculty_account_id == AuthAccount.id,
+        )
+        .where(
+            FacultyProjectAssignment.project_id == project_id,
+            AuthAccount.role == "faculty",
+            AuthAccount.faculty_approved.is_(True),
+        )
+        .order_by(FacultyProjectAssignment.assigned_at)
+    ).scalars().first()
+
+    if faculty_account is None:
+        logger.warning(
+            "n8n notification skipped for submission %s: no approved faculty "
+            "supervisor assigned to project %s.",
+            submission.id,
+            project_id,
+        )
+        return response_payload
+
+    notify_faculty_submission(
+        project_id=project_id,
+        project_name=project.title,
+        submission_id=submission.id,
+        submitted_at=submission.submitted_at,
+        student_name=student.name,
+        student_email=student.email,
+        faculty_email=faculty_account.email,
+        submission_title=f"Week {week_number} Submission \u2013 {project.title}",
+    )
+    # ─────────────────────────────────────────────────────────────────────────
+
+    return response_payload

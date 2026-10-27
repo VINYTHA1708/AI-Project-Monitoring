@@ -359,9 +359,14 @@ td:first-child small { display: block; margin-top: 3px; color: #a0a8b7; font-siz
 .github-stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 22px; }
 .github-contributor-card { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border: 1px solid #e3e8f4; border-radius: 9px; background: #fff; margin-bottom: 8px; }
 .contributor-left { display: flex; align-items: center; gap: 10px; }
-.contributor-avatar { width: 32px; height: 32px; border-radius: 50%; background: #eceff8; object-fit: cover; }
+.contributor-avatar { width: 32px; height: 32px; min-width: 32px; min-height: 32px; border-radius: 50%; background: #eceff8; object-fit: cover; flex: 0 0 32px; display: inline-block; }
+.contributor-avatar-fallback { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; min-width: 32px; min-height: 32px; border-radius: 50%; background: #edf1ff; color: #435fe5; font-weight: 700; font-size: 11px; text-transform: uppercase; border: 1px solid #d9e1f8; box-sizing: border-box; line-height: 1; flex: 0 0 32px; user-select: none; }
 .contributor-name strong { display: block; color: #293853; font-size: 12px; }
 .contributor-name span { color: #8d98ab; font-size: 10px; }
+.contributor-profile-link { color: inherit; text-decoration: none; }
+.contributor-profile-link:hover { text-decoration: underline; color: #4361ee; }
+.contributor-email-link { color: inherit; text-decoration: none; }
+.contributor-email-link:hover { text-decoration: underline; color: #4361ee; }
 .match-badge { padding: 3px 8px; border-radius: 12px; font-size: 9px; font-weight: 700; text-transform: uppercase; }
 .match-verified { background: #eaf8f1; color: #20875e; border: 1px solid #d0f1e1; }
 .match-probable { background: #fff7eb; color: #b07823; border: 1px solid #fae8cc; }

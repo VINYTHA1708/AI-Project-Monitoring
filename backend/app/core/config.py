@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-1.5-flash"
     LLM_PROVIDER: str = "groq"
     GITHUB_TOKEN: str | None = None
+    N8N_WEBHOOK_URL: str | None = None  # e.g. http://localhost:5678/webhook/submission-notify
 
     STUDENT_EMAIL_DOMAINS: str = "vitstudent.ac.in,university.edu"
     FACULTY_EMAIL_ALLOWLIST: str = ""
