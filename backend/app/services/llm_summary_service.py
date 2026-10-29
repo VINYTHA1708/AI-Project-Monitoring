@@ -28,6 +28,28 @@ MAX_INPUT_CHARACTERS = 80_000
 # Cap the evidence user-prompt to stay well within the model's usable input token budget.
 # Truncating here prevents Groq returning empty choices ("model output must contain output text").
 MAX_USER_PROMPT_CHARACTERS = 20_000
+DEFAULT_MAX_DOC_CHARS = 2_500
+
+
+def bound_extracted_document_text(raw_text: str, max_chars: int = DEFAULT_MAX_DOC_CHARS) -> str:
+    """
+    Safely bound extracted deliverable text to minimize LLM token usage while preserving
+    slide/page boundaries and citation markers ([Slide N], [Page N]).
+    """
+    if not raw_text or len(raw_text) <= max_chars:
+        return raw_text or ""
+
+    # Attempt to cut on paragraph or slide/page boundary (\n\n) to avoid breaking mid-unit
+    boundary = raw_text.rfind("\n\n", int(max_chars * 0.75), max_chars)
+    if boundary != -1:
+        cut_point = boundary
+    else:
+        line_break = raw_text.rfind("\n", int(max_chars * 0.85), max_chars)
+        cut_point = line_break if line_break != -1 else max_chars
+
+    truncated = raw_text[:cut_point].rstrip()
+    omitted = len(raw_text) - cut_point
+    return f"{truncated}\n\n... [Content truncated: {omitted} additional characters omitted for verification]"
 
 ADVISORY_DISCLAIMER = (
     "Advisory Notice: This summary and analysis were automatically synthesized by an LLM "
@@ -358,7 +380,7 @@ def gather_project_evidence(project_id: int, db: Session) -> dict[str, Any]:
     from app.services.document_extractor import extract_document_text_from_upload
 
     uploaded_docs: list[dict[str, Any]] = []
-    MAX_DOC_CHARS = 4_000
+    MAX_DOC_CHARS = DEFAULT_MAX_DOC_CHARS
 
     # Look through submissions (latest submissions first, but maintain complete list)
     for s in sorted(submissions, key=lambda x: x.week_number, reverse=True):
@@ -372,9 +394,7 @@ def gather_project_evidence(project_id: int, db: Session) -> dict[str, Any]:
                 continue
             ext_res = extract_document_text_from_upload(file_path)
             raw_text = ext_res.get("extracted_text", "")
-            bounded_text = raw_text[:MAX_DOC_CHARS]
-            if len(raw_text) > MAX_DOC_CHARS:
-                bounded_text += f"\n... [Truncated: {len(raw_text) - MAX_DOC_CHARS} additional characters omitted]"
+            bounded_text = bound_extracted_document_text(raw_text, MAX_DOC_CHARS)
 
             display_name = orig_name or file_path
             uploaded_docs.append({

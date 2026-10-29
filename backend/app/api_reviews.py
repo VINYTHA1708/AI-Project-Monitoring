@@ -1,7 +1,9 @@
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import case
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import (
@@ -10,7 +12,18 @@ from app.auth.dependencies import (
     require_faculty_project,
     require_project_access,
 )
-from app.db.models import AuthAccount, Submission, SubmissionReview
+from app.core.config import settings
+from app.db.models import (
+    AuthAccount,
+    Project,
+    ProjectMember,
+    Student,
+    Submission,
+    SubmissionReview,
+)
+from app.services.n8n_notifier import generate_marks_event_id, notify_student_marks
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/projects/{project_id}/submissions/{submission_id}/reviews",
@@ -99,6 +112,92 @@ def _get_submission_or_404(project_id: int, submission_id: int, db: Session) -> 
     return submission
 
 
+def _dispatch_marks_notification(
+    *,
+    project_id: int,
+    submission: Submission,
+    review: SubmissionReview,
+    account: Principal,
+    db: Session,
+) -> None:
+    """Safely resolve student details and trigger the marks update notification.
+
+    Runs strictly after a successful database commit. Handled safely with logging;
+    any unexpected error will never affect the committed review or fail the API call.
+    Direct HTTP delivery is best-effort and not guaranteed.
+    """
+    try:
+        project = db.get(Project, project_id)
+        project_name = project.title if project else f"Project {project_id}"
+        submission_title = (
+            f"Week {submission.week_number} Submission \u2013 {project_name}"
+            if submission.week_number is not None
+            else f"Submission {submission.id} \u2013 {project_name}"
+        )
+
+        faculty_account = db.get(AuthAccount, account.id)
+        reviewer_name = (
+            faculty_account.faculty_name
+            or faculty_account.email
+            if faculty_account
+            else "Faculty Reviewer"
+        )
+
+        # Resolve authoritative student(s) from project membership
+        students = (
+            db.query(Student)
+            .join(ProjectMember, ProjectMember.student_id == Student.id)
+            .filter(ProjectMember.project_id == project_id)
+            .order_by(
+                case((ProjectMember.role == "LEADER", 0), else_=1),
+                ProjectMember.id.asc(),
+            )
+            .all()
+        )
+
+        if not students:
+            logger.warning(
+                "n8n marks notification skipped for submission %s: no students assigned to project %s.",
+                submission.id,
+                project_id,
+            )
+            return
+
+        frontend_url = None
+        if settings.FRONTEND_URL:
+            frontend_url = f"{settings.FRONTEND_URL.rstrip('/')}/#reviews"
+
+        for student in students:
+            event_id = generate_marks_event_id(
+                review_id=review.id,
+                student_id=student.id,
+                score=review.score,
+                updated_at=review.updated_at,
+            )
+            notify_student_marks(
+                event_id=event_id,
+                student_id=student.id,
+                student_name=student.name,
+                student_email=student.email,
+                project_id=project_id,
+                project_name=project_name,
+                submission_id=submission.id,
+                submission_title=submission_title,
+                marks_awarded=review.score,
+                max_marks=100.0,
+                updated_at=review.updated_at,
+                updated_by=reviewer_name,
+                frontend_url=frontend_url,
+                feedback=review.feedback,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Unexpected error dispatching marks notification for review %s: %s",
+            review.id,
+            exc,
+        )
+
+
 @router.post(
     "/",
     response_model=ReviewResponse,
@@ -152,6 +251,13 @@ def create_review(
     db.refresh(review)
 
     faculty_account = db.get(AuthAccount, account.id)
+    _dispatch_marks_notification(
+        project_id=project_id,
+        submission=submission,
+        review=review,
+        account=account,
+        db=db,
+    )
     return _serialize_review(review, faculty_account)
 
 
@@ -218,7 +324,7 @@ def update_review(
     account: Principal = Depends(require_faculty_project),
     db: Session = Depends(get_db),
 ):
-    _get_submission_or_404(project_id, submission_id, db)
+    submission = _get_submission_or_404(project_id, submission_id, db)
 
     review = (
         db.query(SubmissionReview)
@@ -249,13 +355,32 @@ def update_review(
             detail="Feedback must contain non-whitespace text.",
         )
 
+    score_changed = (review.score != data.score)
+    feedback_changed = (review.feedback != cleaned_feedback)
+
     review.score = data.score
     review.feedback = cleaned_feedback
     review.updated_at = datetime.now(timezone.utc)
 
     db.commit()
     db.refresh(review)
-    return _serialize_review(review)
+
+    if score_changed or feedback_changed:
+        _dispatch_marks_notification(
+            project_id=project_id,
+            submission=submission,
+            review=review,
+            account=account,
+            db=db,
+        )
+    else:
+        logger.info(
+            "Review %s updated with identical score and feedback; skipping n8n notification.",
+            review.id,
+        )
+
+    faculty_account = db.get(AuthAccount, account.id)
+    return _serialize_review(review, faculty_account)
 
 
 @router.delete(

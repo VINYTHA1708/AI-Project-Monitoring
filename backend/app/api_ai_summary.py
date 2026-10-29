@@ -1,10 +1,43 @@
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import logging
+import threading
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+# Guard against duplicate concurrent summary generations for the same project
+_ACTIVE_GENERATIONS: set[int] = set()
+_ACTIVE_GENERATIONS_LOCK = threading.Lock()
+
+
+@contextmanager
+def _acquire_project_generation_lock(project_id: int):
+    """
+    Safely guard against concurrent duplicate summary generations for the same project
+    within this worker process. If generation is already underway for this project,
+    raises 409 Conflict.
+
+    Note on multi-worker / multi-process architectures:
+    This in-memory lock prevents concurrent redundant requests within the same process.
+    In a distributed multi-worker deployment (e.g. Gunicorn with multiple worker processes),
+    a shared distributed lock (such as Redis or a database row-level / advisory lock)
+    would be required to prevent concurrency across distinct worker processes.
+    """
+    with _ACTIVE_GENERATIONS_LOCK:
+        if project_id in _ACTIVE_GENERATIONS:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"AI summary generation is already in progress for project {project_id}. Please wait for it to complete.",
+            )
+        _ACTIVE_GENERATIONS.add(project_id)
+    try:
+        yield
+    finally:
+        with _ACTIVE_GENERATIONS_LOCK:
+            _ACTIVE_GENERATIONS.discard(project_id)
 
 from app.auth.dependencies import (
     get_db,
@@ -159,128 +192,129 @@ def generate_ai_summary(
             ),
         )
 
-    try:
-        evidence = gather_project_evidence(project_id, db)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    with _acquire_project_generation_lock(project_id):
+        try:
+            evidence = gather_project_evidence(project_id, db)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    try:
-        summary_result = provider.generate_summary(evidence)
-    except ValueError as exc:
-        logger.error("Evidence validation error generating AI summary for project %s: %s", project_id, exc)
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except LLMServiceError as exc:
-        logger.error("Provider failure generating AI summary for project %s: %s", project_id, exc)
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        try:
+            summary_result = provider.generate_summary(evidence)
+        except ValueError as exc:
+            logger.error("Evidence validation error generating AI summary for project %s: %s", project_id, exc)
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except LLMServiceError as exc:
+            logger.error("Provider failure generating AI summary for project %s: %s", project_id, exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    try:
-        # Persist individual document relevance analyses
-        for doc_res in summary_result.get("document_results", []):
-            sub_id = doc_res.get("submission_id")
-            f_type = doc_res.get("file_type")
-            if sub_id and f_type:
-                existing_analysis = db.query(DocumentRelevanceAnalysis).filter_by(
-                    submission_id=sub_id,
-                    file_type=f_type,
-                ).first()
-                if existing_analysis is None:
-                    existing_analysis = DocumentRelevanceAnalysis(
-                        project_id=project_id,
+        try:
+            # Persist individual document relevance analyses
+            for doc_res in summary_result.get("document_results", []):
+                sub_id = doc_res.get("submission_id")
+                f_type = doc_res.get("file_type")
+                if sub_id and f_type:
+                    existing_analysis = db.query(DocumentRelevanceAnalysis).filter_by(
                         submission_id=sub_id,
                         file_type=f_type,
-                        document_identifier=doc_res.get("document_identifier", f"sub_{sub_id}_{f_type}"),
-                        file_name=doc_res.get("file_name", ""),
-                    )
-                    db.add(existing_analysis)
-                existing_analysis.document_title = doc_res.get("document_title", "Not extractable")
-                existing_analysis.document_headings = doc_res.get("document_headings") or []
-                existing_analysis.detected_document_topic = doc_res.get("detected_document_topic", "")
-                existing_analysis.assigned_project_title = project.title
-                existing_analysis.title_match_explanation = doc_res.get("title_match_explanation")
-                existing_analysis.content_match_explanation = doc_res.get("content_match_explanation")
-                existing_analysis.document_relevance = doc_res.get("document_relevance", "INSUFFICIENT_CONTENT")
-                existing_analysis.supporting_evidence = doc_res.get("supporting_evidence") or []
-                existing_analysis.conflicting_evidence = doc_res.get("conflicting_evidence") or []
-                existing_analysis.missing_evidence = doc_res.get("missing_evidence") or []
-                existing_analysis.recommended_action = doc_res.get("recommended_action")
-                existing_analysis.confidence = doc_res.get("confidence")
-                existing_analysis.analyzed_at = datetime.now(timezone.utc)
+                    ).first()
+                    if existing_analysis is None:
+                        existing_analysis = DocumentRelevanceAnalysis(
+                            project_id=project_id,
+                            submission_id=sub_id,
+                            file_type=f_type,
+                            document_identifier=doc_res.get("document_identifier", f"sub_{sub_id}_{f_type}"),
+                            file_name=doc_res.get("file_name", ""),
+                        )
+                        db.add(existing_analysis)
+                    existing_analysis.document_title = doc_res.get("document_title", "Not extractable")
+                    existing_analysis.document_headings = doc_res.get("document_headings") or []
+                    existing_analysis.detected_document_topic = doc_res.get("detected_document_topic", "")
+                    existing_analysis.assigned_project_title = project.title
+                    existing_analysis.title_match_explanation = doc_res.get("title_match_explanation")
+                    existing_analysis.content_match_explanation = doc_res.get("content_match_explanation")
+                    existing_analysis.document_relevance = doc_res.get("document_relevance", "INSUFFICIENT_CONTENT")
+                    existing_analysis.supporting_evidence = doc_res.get("supporting_evidence") or []
+                    existing_analysis.conflicting_evidence = doc_res.get("conflicting_evidence") or []
+                    existing_analysis.missing_evidence = doc_res.get("missing_evidence") or []
+                    existing_analysis.recommended_action = doc_res.get("recommended_action")
+                    existing_analysis.confidence = doc_res.get("confidence")
+                    existing_analysis.analyzed_at = datetime.now(timezone.utc)
 
-        db_summary = ProjectAISummary(
-            project_id=project_id,
-            provider=summary_result.get("provider") or provider.get_provider_name(),
-            model_name=summary_result.get("model_name") or provider.get_model_name(),
-            summary_text=summary_result.get("summary") or summary_result.get("summary_text") or "",
-            key_points=summary_result.get("key_points") or [],
-            risks=summary_result.get("risks") or [],
-            recommended_next_steps=summary_result.get("recommended_next_steps") or [],
-            review_questions=summary_result.get("review_questions") or [],
-            evidence_sources=summary_result.get("evidence_sources") or [],
-            advisory_disclaimer=summary_result.get("advisory_disclaimer"),
-            document_relevance=summary_result.get("document_relevance"),
-            detected_document_topic=summary_result.get("detected_document_topic"),
-            assigned_project_topic=summary_result.get("assigned_project_topic"),
-            relevance_explanation=summary_result.get("relevance_explanation"),
-            supporting_evidence=summary_result.get("supporting_evidence"),
-            relevant_findings=summary_result.get("relevant_findings"),
-            missing_evidence=summary_result.get("missing_evidence"),
-            progress_assessment=summary_result.get("progress_assessment"),
-            confidence=summary_result.get("confidence"),
-            document_results=summary_result.get("document_results") or [],
-            submission_verification_status=summary_result.get("submission_verification_status"),
-            relevant_documents_count=summary_result.get("relevant_documents_count", 0),
-            partially_relevant_documents_count=summary_result.get("partially_relevant_documents_count", 0),
-            unrelated_documents_count=summary_result.get("unrelated_documents_count", 0),
-            insufficient_content_documents_count=summary_result.get("insufficient_content_documents_count", 0),
-            created_at=datetime.now(timezone.utc),
-        )
-        db.add(db_summary)
-        db.commit()
-        db.refresh(db_summary)
-    except Exception as exc:
-        db.rollback()
-        logger.error(
-            "Failed to persist AI summary for project %s: %s: %s",
-            project_id,
-            type(exc).__name__,
-            exc,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Failed to persist AI summary snapshot. "
-                "Ensure database migrations 0003_github_and_ai_summaries.sql, "
-                "0004_ai_summary_relevance.sql, and 0005_document_relevance_analyses.sql are applied."
-            ),
-        ) from exc
+            db_summary = ProjectAISummary(
+                project_id=project_id,
+                provider=summary_result.get("provider") or provider.get_provider_name(),
+                model_name=summary_result.get("model_name") or provider.get_model_name(),
+                summary_text=summary_result.get("summary") or summary_result.get("summary_text") or "",
+                key_points=summary_result.get("key_points") or [],
+                risks=summary_result.get("risks") or [],
+                recommended_next_steps=summary_result.get("recommended_next_steps") or [],
+                review_questions=summary_result.get("review_questions") or [],
+                evidence_sources=summary_result.get("evidence_sources") or [],
+                advisory_disclaimer=summary_result.get("advisory_disclaimer"),
+                document_relevance=summary_result.get("document_relevance"),
+                detected_document_topic=summary_result.get("detected_document_topic"),
+                assigned_project_topic=summary_result.get("assigned_project_topic"),
+                relevance_explanation=summary_result.get("relevance_explanation"),
+                supporting_evidence=summary_result.get("supporting_evidence"),
+                relevant_findings=summary_result.get("relevant_findings"),
+                missing_evidence=summary_result.get("missing_evidence"),
+                progress_assessment=summary_result.get("progress_assessment"),
+                confidence=summary_result.get("confidence"),
+                document_results=summary_result.get("document_results") or [],
+                submission_verification_status=summary_result.get("submission_verification_status"),
+                relevant_documents_count=summary_result.get("relevant_documents_count", 0),
+                partially_relevant_documents_count=summary_result.get("partially_relevant_documents_count", 0),
+                unrelated_documents_count=summary_result.get("unrelated_documents_count", 0),
+                insufficient_content_documents_count=summary_result.get("insufficient_content_documents_count", 0),
+                created_at=datetime.now(timezone.utc),
+            )
+            db.add(db_summary)
+            db.commit()
+            db.refresh(db_summary)
+        except Exception as exc:
+            db.rollback()
+            logger.error(
+                "Failed to persist AI summary for project %s: %s: %s",
+                project_id,
+                type(exc).__name__,
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Failed to persist AI summary snapshot. "
+                    "Ensure database migrations 0003_github_and_ai_summaries.sql, "
+                    "0004_ai_summary_relevance.sql, and 0005_document_relevance_analyses.sql are applied."
+                ),
+            ) from exc
 
-    return AISummaryResponse(
-        id=db_summary.id,
-        project_id=db_summary.project_id,
-        provider=db_summary.provider,
-        model_name=db_summary.model_name,
-        summary_text=db_summary.summary_text,
-        key_points=db_summary.key_points or [],
-        risks=db_summary.risks or [],
-        recommended_next_steps=db_summary.recommended_next_steps or [],
-        review_questions=db_summary.review_questions or [],
-        evidence_sources=db_summary.evidence_sources or [],
-        advisory_disclaimer=db_summary.advisory_disclaimer,
-        created_at=db_summary.created_at,
-        provider_configured=True,
-        document_relevance=getattr(db_summary, "document_relevance", None),
-        detected_document_topic=getattr(db_summary, "detected_document_topic", None),
-        assigned_project_topic=getattr(db_summary, "assigned_project_topic", None),
-        relevance_explanation=getattr(db_summary, "relevance_explanation", None),
-        supporting_evidence=getattr(db_summary, "supporting_evidence", None) or [],
-        relevant_findings=getattr(db_summary, "relevant_findings", None) or getattr(db_summary, "key_points", None) or [],
-        missing_evidence=getattr(db_summary, "missing_evidence", None) or [],
-        progress_assessment=getattr(db_summary, "progress_assessment", None),
-        confidence=getattr(db_summary, "confidence", None),
-        document_results=getattr(db_summary, "document_results", None) or [],
-        submission_verification_status=getattr(db_summary, "submission_verification_status", None),
-        relevant_documents_count=getattr(db_summary, "relevant_documents_count", 0) or 0,
-        partially_relevant_documents_count=getattr(db_summary, "partially_relevant_documents_count", 0) or 0,
-        unrelated_documents_count=getattr(db_summary, "unrelated_documents_count", 0) or 0,
-        insufficient_content_documents_count=getattr(db_summary, "insufficient_content_documents_count", 0) or 0,
-    )
+        return AISummaryResponse(
+            id=db_summary.id,
+            project_id=db_summary.project_id,
+            provider=db_summary.provider,
+            model_name=db_summary.model_name,
+            summary_text=db_summary.summary_text,
+            key_points=db_summary.key_points or [],
+            risks=db_summary.risks or [],
+            recommended_next_steps=db_summary.recommended_next_steps or [],
+            review_questions=db_summary.review_questions or [],
+            evidence_sources=db_summary.evidence_sources or [],
+            advisory_disclaimer=db_summary.advisory_disclaimer,
+            created_at=db_summary.created_at,
+            provider_configured=True,
+            document_relevance=getattr(db_summary, "document_relevance", None),
+            detected_document_topic=getattr(db_summary, "detected_document_topic", None),
+            assigned_project_topic=getattr(db_summary, "assigned_project_topic", None),
+            relevance_explanation=getattr(db_summary, "relevance_explanation", None),
+            supporting_evidence=getattr(db_summary, "supporting_evidence", None) or [],
+            relevant_findings=getattr(db_summary, "relevant_findings", None) or getattr(db_summary, "key_points", None) or [],
+            missing_evidence=getattr(db_summary, "missing_evidence", None) or [],
+            progress_assessment=getattr(db_summary, "progress_assessment", None),
+            confidence=getattr(db_summary, "confidence", None),
+            document_results=getattr(db_summary, "document_results", None) or [],
+            submission_verification_status=getattr(db_summary, "submission_verification_status", None),
+            relevant_documents_count=getattr(db_summary, "relevant_documents_count", 0) or 0,
+            partially_relevant_documents_count=getattr(db_summary, "partially_relevant_documents_count", 0) or 0,
+            unrelated_documents_count=getattr(db_summary, "unrelated_documents_count", 0) or 0,
+            insufficient_content_documents_count=getattr(db_summary, "insufficient_content_documents_count", 0) or 0,
+        )

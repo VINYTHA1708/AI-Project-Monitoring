@@ -20,11 +20,15 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str | None = None
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     GROQ_MAX_TOKENS: int = Field(default=3000, gt=0, le=32768)
+    GROQ_VERIFICATION_MAX_TOKENS: int = Field(default=1500, gt=0, le=8192)
     GEMINI_API_KEY: str | None = None
     GEMINI_MODEL: str = "gemini-1.5-flash"
     LLM_PROVIDER: str = "groq"
     GITHUB_TOKEN: str | None = None
     N8N_WEBHOOK_URL: str | None = None  # e.g. http://localhost:5678/webhook/submission-notify
+    N8N_MARKS_UPDATED_WEBHOOK_URL: str | None = None
+    N8N_WEBHOOK_SECRET: str | None = None
+    FRONTEND_URL: str | None = None
 
     STUDENT_EMAIL_DOMAINS: str = "vitstudent.ac.in,university.edu"
     FACULTY_EMAIL_ALLOWLIST: str = ""
