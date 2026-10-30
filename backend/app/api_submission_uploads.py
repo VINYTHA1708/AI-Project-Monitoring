@@ -10,8 +10,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.auth.dependencies import Principal, get_db, require_project_access
+from app.core.config import settings
 from app.db.models import AuthAccount, FacultyProjectAssignment, Project, Student, Submission
-from app.services.n8n_notifier import notify_faculty_submission
+from app.services.n8n_notifier import (
+    generate_submission_event_id,
+    notify_faculty_submission,
+)
 
 router = APIRouter(
     prefix="/projects",
@@ -245,9 +249,10 @@ async def upload_submission(
         )
         return response_payload
 
-    # Faculty identity ── pick the earliest-assigned approved supervisor so the
-    # result is deterministic when multiple supervisors exist.
-    faculty_account = db.execute(
+    # Faculty identity ── retrieve ALL approved faculty assigned to the project.
+    # We query the authoritative FacultyProjectAssignment and AuthAccount relationship,
+    # filtering by project_id, faculty role, and approved status.
+    faculty_accounts = db.execute(
         select(AuthAccount)
         .join(
             FacultyProjectAssignment,
@@ -258,17 +263,44 @@ async def upload_submission(
             AuthAccount.role == "faculty",
             AuthAccount.faculty_approved.is_(True),
         )
-        .order_by(FacultyProjectAssignment.assigned_at)
-    ).scalars().first()
+        .order_by(FacultyProjectAssignment.assigned_at, AuthAccount.id)
+    ).scalars().all()
 
-    if faculty_account is None:
+    student_email_normalized = student.email.strip().lower() if student.email else ""
+    seen_emails: set[str] = set()
+    faculty_recipients: list[dict[str, Any]] = []
+
+    for fac in faculty_accounts:
+        if not fac.email or not fac.email.strip():
+            continue
+        norm_email = fac.email.strip().lower()
+        if "@" not in norm_email or len(norm_email) < 5:
+            continue
+        # Never send the notification to the submitting student's email address
+        if norm_email == student_email_normalized:
+            continue
+        if norm_email in seen_emails:
+            continue
+        seen_emails.add(norm_email)
+        faculty_recipients.append({
+            "faculty_id": fac.faculty_id or "",
+            "faculty_name": fac.faculty_name or "",
+            "faculty_email": norm_email,
+        })
+
+    if not faculty_recipients:
         logger.warning(
             "n8n notification skipped for submission %s: no approved faculty "
-            "supervisor assigned to project %s.",
+            "members with valid email assigned to project %s.",
             submission.id,
             project_id,
         )
         return response_payload
+
+    evt_id = generate_submission_event_id(submission.id, submission.submitted_at)
+    primary_faculty_email = faculty_recipients[0]["faculty_email"]
+    frontend_base = (settings.FRONTEND_URL or "").rstrip("/")
+    dashboard_url = f"{frontend_base}/projects/{project_id}" if frontend_base else None
 
     notify_faculty_submission(
         project_id=project_id,
@@ -277,8 +309,14 @@ async def upload_submission(
         submitted_at=submission.submitted_at,
         student_name=student.name,
         student_email=student.email,
-        faculty_email=faculty_account.email,
+        faculty_email=primary_faculty_email,
+        faculty_recipients=faculty_recipients,
         submission_title=f"Week {week_number} Submission \u2013 {project.title}",
+        event_id=evt_id,
+        student_registration_number=student.registration_number,
+        week_number=week_number,
+        dashboard_url=dashboard_url,
+        notification_type="student_submission",
     )
     # ─────────────────────────────────────────────────────────────────────────
 

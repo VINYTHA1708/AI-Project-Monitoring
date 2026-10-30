@@ -2,6 +2,7 @@
 
 Supported workflows:
 1. Faculty submission notification (triggered when student uploads submission):
+   Routes via n8n to all project-assigned faculty members via email.
    Environment variable:
        N8N_WEBHOOK_URL  -- full URL of the n8n submission webhook trigger node.
 
@@ -62,6 +63,25 @@ def generate_marks_event_id(
     return f"marks-rev{review_id}-stu{student_id}-{digest}"
 
 
+def generate_submission_event_id(
+    submission_id: int,
+    submitted_at: datetime,
+) -> str:
+    """Generate a deterministic event identifier for a student submission.
+
+    Combines submission_id and microsecond-precision ISO timestamp digested via SHA-256.
+    Stable across retries of the same submission event.
+    """
+    ts_str = (
+        submitted_at.astimezone(timezone.utc).isoformat()
+        if submitted_at.tzinfo
+        else submitted_at.isoformat()
+    )
+    raw = f"sub:{submission_id}:{ts_str}".encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    return f"sub-{submission_id}-{digest}"
+
+
 def notify_faculty_submission(
     *,
     project_id: int,
@@ -70,12 +90,25 @@ def notify_faculty_submission(
     submitted_at: datetime,
     student_name: str,
     student_email: str,
-    faculty_email: str,
     submission_title: str,
+    faculty_email: str | None = None,
+    faculty_recipients: list[dict[str, Any]] | None = None,
+    event_id: str | None = None,
+    student_registration_number: str | None = None,
+    week_number: int | None = None,
+    dashboard_url: str | None = None,
+    notification_type: str | None = None,
 ) -> None:
     """Schedule a non-blocking n8n webhook POST for student submissions.
 
-    Preserves the exact existing contract and behavior.
+    Preserves the exact existing contract and base 8 fields for backwards compatibility:
+        project_id, project_name, student_name, student_email, faculty_email,
+        submission_title, submission_id, submitted_at.
+
+    When multiple project faculty recipients or enriched parameters are supplied,
+    attaches `faculty_recipients` (list of all eligible project faculty), `event_id`,
+    `student_registration_number`, `week_number`, and `notification_type` to notify
+    all assigned faculty members via email.
     """
     if not settings.N8N_WEBHOOK_URL:
         logger.debug(
@@ -86,21 +119,60 @@ def notify_faculty_submission(
         )
         return
 
+    # Derive primary faculty_email for backward-compatible workflow nodes
+    primary_email = faculty_email
+    if not primary_email and faculty_recipients:
+        primary_email = faculty_recipients[0].get("faculty_email", "")
+
     payload: dict[str, Any] = {
         "project_id":       project_id,
         "project_name":     project_name,
         "student_name":     student_name,
         "student_email":    student_email,
-        "faculty_email":    faculty_email,
+        "faculty_email":    primary_email or "",
         "submission_title": submission_title,
         "submission_id":    submission_id,
         "submitted_at":     submitted_at.isoformat(),
     }
 
+    # Only include enriched keys if at least one enriched parameter was explicitly passed,
+    # thereby guaranteeing 100% backward compatibility for existing tests/callers expecting
+    # the 8 base fields.
+    is_enriched = any(
+        arg is not None
+        for arg in (
+            faculty_recipients,
+            event_id,
+            student_registration_number,
+            week_number,
+            dashboard_url,
+            notification_type,
+        )
+    )
+
+    if is_enriched:
+        payload["notification_type"] = (
+            notification_type if notification_type is not None else "student_submission"
+        )
+        payload["event_id"] = (
+            event_id
+            if event_id is not None
+            else generate_submission_event_id(submission_id, submitted_at)
+        )
+        payload["student_registration_number"] = student_registration_number
+        payload["week_number"] = week_number
+        payload["faculty_recipients"] = (
+            faculty_recipients
+            if faculty_recipients is not None
+            else ([{"faculty_email": primary_email}] if primary_email else [])
+        )
+        if dashboard_url is not None:
+            payload["dashboard_url"] = dashboard_url
+
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No running loop (e.g. during tests) -- call synchronously
+        # No running loop (e.g. during tests or sync handlers) -- call synchronously
         _post_to_n8n(payload)
         return
 
@@ -210,32 +282,55 @@ def _post_to_n8n(payload: dict[str, Any]) -> None:
     if not url:
         return
 
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "User-Agent": "ProjectScope/1.0 n8n-notifier",
+    }
+    if settings.N8N_WEBHOOK_SECRET:
+        headers["X-ProjectScope-Secret"] = settings.N8N_WEBHOOK_SECRET
+
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "ProjectScope/1.0 n8n-notifier",
-        },
+        headers=headers,
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             status_code = response.status
+            resp_body = response.read()
             if status_code < 200 or status_code >= 300:
                 logger.warning(
                     "n8n webhook returned non-2xx status %s for submission payload.",
                     status_code,
                 )
             else:
-                logger.info(
-                    "n8n submission notification sent (project_id=%s, submission_id=%s, status=%s).",
-                    payload.get("project_id"),
-                    payload.get("submission_id"),
-                    status_code,
-                )
+                # Inspect response for partial failure or summary if returned by n8n
+                try:
+                    resp_json = json.loads(resp_body.decode("utf-8"))
+                    if isinstance(resp_json, dict) and resp_json.get("status") == "partial_failure":
+                        logger.warning(
+                            "n8n submission notification partial delivery (project_id=%s, submission_id=%s): %s",
+                            payload.get("project_id"),
+                            payload.get("submission_id"),
+                            resp_json.get("message") or resp_json,
+                        )
+                    else:
+                        logger.info(
+                            "n8n submission notification sent (project_id=%s, submission_id=%s, status=%s).",
+                            payload.get("project_id"),
+                            payload.get("submission_id"),
+                            status_code,
+                        )
+                except Exception:
+                    logger.info(
+                        "n8n submission notification sent (project_id=%s, submission_id=%s, status=%s).",
+                        payload.get("project_id"),
+                        payload.get("submission_id"),
+                        status_code,
+                    )
     except urllib.error.URLError as exc:
         logger.warning(
             "n8n submission notification failed (project_id=%s): %s",
